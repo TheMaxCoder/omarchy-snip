@@ -538,7 +538,7 @@ case "$*" in *--primary*) printf 'selection text' ;; *) printf 'clipboard text' 
         body = "\n# Démo\r\nline two\n\n"
         stdin_item = self.snip("add", "--stdin", "--category", "examples", "--pin", stdin=body)
         self.assertEqual(stdin_item["categoryId"], primary["categoryId"])
-        self.assertEqual((stdin_item["title"], stdin_item["body"]), ("Démo", body))
+        self.assertEqual((stdin_item["title"], stdin_item["body"]), ("Démo", body[:-1]))
         self.assertTrue(stdin_item["pinned"])
         promoted = self.snip("add", "--stdin", stdin="selection text")
         self.assertEqual(promoted["id"], primary["id"])
@@ -546,6 +546,24 @@ case "$*" in *--primary*) printf 'selection text' ;; *) printf 'clipboard text' 
         self.assertIsNone(promoted["categoryId"])
         self.assertIn("No text to save", self.snip("add", "--stdin", stdin="\n ", success=False))
         self.assertNotEqual(self.run_snip("add", "--stdin", "--primary", stdin="x").returncode, 0)
+
+    def test_capture_stdin_strips_exactly_one_trailing_newline(self):
+        for source, expected in (
+            ("snippet\n", "snippet"),
+            ("snippet\r\n", "snippet"),
+            ("snippet\n\n", "snippet\n"),
+            ("snippet\r\n\r\n", "snippet\r\n"),
+            ("snippet\r", "snippet\r"),
+            ("snippet  \n", "snippet  "),
+            ("snippet", "snippet"),
+        ):
+            with self.subTest(source=source):
+                item = self.snip("add", "--stdin", stdin=source)
+                self.assertEqual(item["body"], expected)
+        self.paste_stub()
+        item = self.snip("add", "--stdin", stdin="ready to paste\r\n")
+        self.snip("paste", "--id", item["id"], "--copy-only")
+        self.assertEqual((self.root / "paste-bytes").read_bytes(), b"ready to paste")
 
     def test_capture_notification_is_opt_in_and_optional(self):
         self.snip("add", "--stdin", "--notify", stdin="No notifier")
@@ -559,7 +577,7 @@ exit 1''')
         self.assertEqual(notice.read_text().splitlines(), ["-a", "Snip", "Snip saved a snippet", "Example"])
 
     def test_json_round_trip_preserves_text_and_references_images(self):
-        first = self.snip("add", "--stdin", "--category", "Examples", "--title", "Café", stdin="\nbody\r\n\n")
+        first = self.snip("add", "--stdin", "--category", "Examples", "--title", "Café", stdin="\nbody\r\n\n\n")
         self.snip("used", first["id"])
         self.snip("add", "--stdin", stdin="Uncategorized")
         self.snip("add", "--stdin", stdin="Another pinned item")
@@ -604,7 +622,7 @@ exit 1''')
         examples = ["Short text", "\n## Nested heading\n```\ntext in code\n```\n\n",
                     "\nonly a leading newline and CRLF\r\n  ", "```unclosed\nplain text", "## Heading at start"]
         for index, body in enumerate(examples):
-            self.snip("add", "--stdin", "--category", "Café notes", "--title", f"Example {index}", stdin=body)
+            self.snip("add", "--stdin", "--category", "Café notes", "--title", f"Example {index}", stdin=body + "\n")
         self.snip("add", "--stdin", "--category", "Pinned", "--title", "Categorized", stdin="named Pinned")
         title = "Separator & &#10;\r\nSecond line"
         self.snip("add", "--stdin", "--category", "A/B%20", "--title", title, stdin="category path")
@@ -648,6 +666,20 @@ exit 1''')
         broken.write_text('{"format":"snip","version":2,"categories":[],"items":[]}')
         self.assertIn("Expected a Snip JSON export", self.snip("import", broken, success=False))
         self.assertEqual(self.snip("snapshot")["items"], items)
+
+    def test_top_level_help_lists_only_public_commands(self):
+        result = self.run_snip("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        public = {"add", "paste", "edit", "export", "import", "doctor", "config"}
+        internal = ("snapshot", "pin-inbox", "save-inbox", "save-inbox-new", "toggle-pin", "delete",
+                    "delete-category", "create-category", "used")
+        listed = {line.split()[0] for line in result.stdout.partition("commands:\n")[2].splitlines()
+                  if line.startswith("    ")}
+        self.assertEqual(listed, public)
+        for command in internal:
+            self.assertNotIn(command, result.stdout)
+        self.assertNotIn("==SUPPRESS==", result.stdout)
+        self.assertEqual(self.run_snip("snapshot").returncode, 0)
 
     def test_default_cli_uses_public_plugin_id(self):
         self.executable("omarchy-shell", r'''printf '"%s %s %s %s"\n' "$1" "$2" "$3" "$4"''')

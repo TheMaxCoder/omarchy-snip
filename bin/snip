@@ -737,7 +737,11 @@ def current_clipboard_text(*, primary: bool = False) -> str:
 
 
 def capture(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[str, object]:
-    body = sys.stdin.buffer.read().decode("utf-8") if args.stdin else current_clipboard_text(primary=args.primary)
+    if args.stdin:
+        body = sys.stdin.buffer.read().decode("utf-8")
+        body = body[:-2] if body.endswith("\r\n") else body.removesuffix("\n")
+    else:
+        body = current_clipboard_text(primary=args.primary)
     if not body.strip():
         raise ValueError("No text to save" if args.stdin else "clipboard is empty or does not contain text")
     title = (args.title or "").strip() or display_title(body)
@@ -847,13 +851,17 @@ def doctor() -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage the Snip library")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        description="Manage the Snip library. Run snip with no arguments to toggle the picker.",
+        epilog="Run snip COMMAND --help for command-specific options.",
+    )
+    # A metavar hides the full choices list; parsers without help stay off the menu.
+    subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND", title="commands")
     subparsers.add_parser("snapshot")
     subparsers.add_parser(
         "config",
         help="show effective settings and warnings as JSON",
-        description="Show defaults merged with the optional Snip config.json.",
+        description="Show defaults merged with ${XDG_CONFIG_HOME:-~/.config}/snip/config.json, with validation warnings.",
         epilog=(
             "Key specs use Ctrl, Alt, Shift, and Super plus a printable character or a Qt key "
             "name without Key_. Qt resolves named keys and requires exact modifiers. For "
@@ -879,12 +887,19 @@ def build_parser() -> argparse.ArgumentParser:
     save_new.add_argument("--ref", required=True)
     save_new.add_argument("name")
 
-    paste = subparsers.add_parser("paste")
+    paste = subparsers.add_parser(
+        "paste", help="paste or copy a saved snippet or clipboard item",
+        description="Copy an item to the clipboard and paste it into the focused window.",
+    )
     source = paste.add_mutually_exclusive_group(required=True)
-    source.add_argument("--id", type=int)
-    source.add_argument("--ref")
-    paste.add_argument("--copy-only", action="store_true")
-    subparsers.add_parser("doctor")
+    source.add_argument("--id", type=int, metavar="ID", help="saved item ID, as shown by snip add or export")
+    source.add_argument("--ref", metavar="HASH", help="content hash of a current clipboard history item")
+    paste.add_argument("--copy-only", action="store_true", help="copy to the clipboard without pasting")
+    subparsers.add_parser(
+        "doctor", help="check dependencies and diagnose your setup",
+        description="Check tools, clipboard history, configuration, database integrity, and Hyprland bindings. "
+        "Exits nonzero if a required check fails.",
+    )
 
     toggle = subparsers.add_parser("toggle-pin")
     toggle.add_argument("item_id", type=int)
@@ -895,14 +910,18 @@ def build_parser() -> argparse.ArgumentParser:
     delete_category = subparsers.add_parser("delete-category")
     delete_category.add_argument("category_id", type=int)
 
-    edit = subparsers.add_parser("edit")
-    edit.add_argument("item_id", type=int)
+    edit = subparsers.add_parser(
+        "edit", help="open a saved text snippet in your editor",
+        description="Edit a saved text snippet. The first line is the title; the rest is the body.",
+    )
+    edit.add_argument("item_id", type=int, metavar="ID", help="saved item ID, as shown by snip add or export")
 
     category = subparsers.add_parser("create-category")
     category.add_argument("name")
 
     add = subparsers.add_parser(
-        "add", description="Save text from the clipboard, primary selection, or stdin.",
+        "add", help="save text from the clipboard, primary selection, or stdin",
+        description="Save a text snippet and print the saved item as JSON.",
         epilog=(
             "Example for ~/.config/hypr/bindings.lua (snip must be on PATH):\n"
             '  o.bind("SUPER + CTRL + SHIFT + V", "Save selection to Snip", "snip add --primary --notify")'
@@ -910,25 +929,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capture_source = add.add_mutually_exclusive_group()
     capture_source.add_argument("--primary", action="store_true", help="read the primary selection")
-    capture_source.add_argument("--stdin", action="store_true", help="read UTF-8 text from stdin")
+    capture_source.add_argument("--stdin", action="store_true", help="read UTF-8 stdin and remove one trailing newline")
     add.add_argument("--category", metavar="NAME", help="save to this tab, creating it if needed; default: Pinned")
     add.add_argument("--title", help="override the title derived from the first non-empty line")
     add.add_argument("--pin", action="store_true", help="pin the item even when saving to a category")
     add.add_argument("--notify", action="store_true", help="send a desktop notification if notify-send is available")
 
     export = subparsers.add_parser(
-        "export", description="Export Snip as JSON or Markdown. JSON images are referenced by path, not embedded.",
+        "export", help="export the library as JSON or Markdown",
+        description="Export Snip as JSON or Markdown. JSON images are referenced by path, not embedded.",
         epilog="Use JSON to preserve metadata. Markdown is text-only and stores only titles, bodies, and categories.",
     )
-    export.add_argument("--format", choices=("json", "markdown"), default="json")
+    export.add_argument("--format", choices=("json", "markdown"), default="json", help="output format (default: json)")
     export.add_argument("--output", type=Path, metavar="PATH", help="JSON file (default: stdout) or Markdown directory")
     export.add_argument("--skip-images", action="store_true", help="omit images from JSON exports")
 
     import_parser = subparsers.add_parser(
-        "import", description="Import a Snip JSON export, a Markdown file, or a directory of .md files.",
+        "import", help="import snippets from JSON or Markdown",
+        description="Import snippets, skipping duplicate content and printing the imported and skipped counts.",
         epilog="Markdown categories come from the filenames; Pinned.md holds uncategorized, pinned items.",
     )
-    import_parser.add_argument("path", type=Path, metavar="PATH")
+    import_parser.add_argument("path", type=Path, metavar="PATH", help="Snip JSON export, .md file, or directory of .md files")
 
     used = subparsers.add_parser("used")
     used.add_argument("item_id", type=int)

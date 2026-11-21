@@ -1,0 +1,15 @@
+name: CI
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s tests
+      - run: node --test tests/
+      - run: python3 -m py_compile bin/snip
+      - run: |
+          python3 -m json.tool manifest.json >/dev/null
+          python3 -m json.tool config.example.json >/dev/null
