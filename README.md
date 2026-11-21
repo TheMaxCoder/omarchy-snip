@@ -2,11 +2,11 @@
 
 A keyboard-first Omarchy picker for saved snippets and clipboard history.
 
-![Snip showing a Prompts tab with a pinned snippet and its preview](docs/screenshot.png)
+![Snip showing a Prompts tab with a pinned snippet and its preview](preview.png)
 
 ## Install and pick a shortcut
 
-Requires **Omarchy 4** (tested against `4.0.0.alpha`). Keep the built-in `omarchy.clipboard` plugin enabled: it records the history that feeds Snip's Inbox. The other requirements ship with Omarchy.
+Requires **Omarchy 4** (tested against `4.5.0`). Keep the built-in `omarchy.clipboard` plugin enabled: it records the history that feeds Snip's Inbox. The other requirements ship with Omarchy.
 
 ```sh
 omarchy plugin add https://github.com/TheMaxCoder/omarchy-snip --enable

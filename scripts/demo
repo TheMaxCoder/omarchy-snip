@@ -154,7 +154,7 @@ entries = [
     {"type": "text", "text": "ffmpeg -i talk.mp4 -vf scale=1280:-2 -c:a copy talk-720p.mp4"},
     {"type": "text", "text": "#89b4fa"},
     {"type": "text", "text": "Meeting moved to Thursday 15:00. Same room, same agenda."},
-    {"type": "text", "text": "sudo pacman -Syu"},
+    {"type": "text", "text": "git log --oneline -10"},
     {"type": "text", "text": "Order #4821 ships Monday; tracking will follow by email."},
     {"type": "text", "text": "export EDITOR=nvim"},
 ]
