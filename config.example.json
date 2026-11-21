@@ -1,0 +1,24 @@
+{
+  "startInSearch": false,
+  "terminal": [],
+  "editor": "",
+  "keys": {
+    "up": ["Up", "k"],
+    "down": ["Down", "j"],
+    "prevTab": ["Left", "h", "Shift+Tab"],
+    "nextTab": ["Right", "l", "Tab"],
+    "first": ["Home", "g"],
+    "last": ["End", "Shift+G"],
+    "paste": ["Return", "Enter", "p"],
+    "copy": ["y", "Ctrl+C", "Super+C"],
+    "pin": ["f"],
+    "save": ["s"],
+    "edit": ["i"],
+    "delete": ["d"],
+    "newTab": ["Shift+N"],
+    "deleteTab": ["Shift+D"],
+    "search": ["/"],
+    "back": ["Escape"],
+    "close": ["q"]
+  }
+}

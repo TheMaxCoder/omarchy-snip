@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -26,11 +27,63 @@ DATABASE = DATA_DIR / "snip.db"
 CLIPBOARD_HISTORY = Path(
     os.environ.get(
         "SNIP_CLIPBOARD_FILE",
-        Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
-        / "omarchy/clipboard-history.json",
+        Path.home() / ".local/state/omarchy/clipboard-history.json",
     )
-)
-LEGACY_DIR = Path(os.environ.get("SNIP_LEGACY_DIR", Path.home() / ".config/snip"))
+).absolute()
+CONFIG_FILE = Path(
+    os.environ.get("SNIP_CONFIG_FILE")
+    or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "snip/config.json"
+).absolute()
+DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.example.json"
+KEY_MODIFIERS = {"Ctrl", "Alt", "Shift", "Super"}
+# Multi-character Qt::Key names (Qt 6.12), kept here so config validation
+# does not need Python Qt bindings or a live shell. Function keys are generated.
+QT_KEYS = frozenset("""
+    Space Any Exclam QuoteDbl NumberSign Dollar Percent Ampersand Apostrophe ParenLeft
+    ParenRight Asterisk Plus Comma Minus Period Slash Colon Semicolon Less Equal Greater
+    Question At BracketLeft Backslash BracketRight AsciiCircum Underscore QuoteLeft BraceLeft
+    Bar BraceRight AsciiTilde nobreakspace exclamdown cent sterling currency yen brokenbar
+    section diaeresis copyright ordfeminine guillemotleft notsign hyphen registered macron
+    degree plusminus twosuperior threesuperior acute micro paragraph periodcentered cedilla
+    onesuperior masculine guillemotright onequarter onehalf threequarters questiondown Agrave
+    Aacute Acircumflex Atilde Adiaeresis Aring AE Ccedilla Egrave Eacute Ecircumflex Ediaeresis
+    Igrave Iacute Icircumflex Idiaeresis ETH Ntilde Ograve Oacute Ocircumflex Otilde Odiaeresis
+    multiply Ooblique Ugrave Uacute Ucircumflex Udiaeresis Yacute THORN ssharp division
+    ydiaeresis Escape Tab Backtab Backspace Return Enter Insert Delete Pause Print SysReq Clear
+    Home End Left Up Right Down PageUp PageDown Shift Control Meta Alt CapsLock NumLock
+    ScrollLock Super_L Super_R Menu Hyper_L Hyper_R Help Direction_L Direction_R AltGr
+    Multi_key Codeinput SingleCandidate MultipleCandidate PreviousCandidate Mode_switch Kanji
+    Muhenkan Henkan Romaji Hiragana Katakana Hiragana_Katakana Zenkaku Hankaku Zenkaku_Hankaku
+    Touroku Massyo Kana_Lock Kana_Shift Eisu_Shift Eisu_toggle Hangul Hangul_Start Hangul_End
+    Hangul_Hanja Hangul_Jamo Hangul_Romaja Hangul_Jeonja Hangul_Banja Hangul_PreHanja
+    Hangul_PostHanja Hangul_Special Dead_Grave Dead_Acute Dead_Circumflex Dead_Tilde
+    Dead_Macron Dead_Breve Dead_Abovedot Dead_Diaeresis Dead_Abovering Dead_Doubleacute
+    Dead_Caron Dead_Cedilla Dead_Ogonek Dead_Iota Dead_Voiced_Sound Dead_Semivoiced_Sound
+    Dead_Belowdot Dead_Hook Dead_Horn Dead_Stroke Dead_Abovecomma Dead_Abovereversedcomma
+    Dead_Doublegrave Dead_Belowring Dead_Belowmacron Dead_Belowcircumflex Dead_Belowtilde
+    Dead_Belowbreve Dead_Belowdiaeresis Dead_Invertedbreve Dead_Belowcomma Dead_Currency Dead_a
+    Dead_A Dead_e Dead_E Dead_i Dead_I Dead_o Dead_O Dead_u Dead_U Dead_Small_Schwa
+    Dead_Capital_Schwa Dead_Greek Dead_Lowline Dead_Aboveverticalline Dead_Belowverticalline
+    Dead_Longsolidusoverlay Back Forward Stop Refresh VolumeDown VolumeMute VolumeUp BassBoost
+    BassUp BassDown TrebleUp TrebleDown MediaPlay MediaStop MediaPrevious MediaNext MediaRecord
+    MediaPause MediaTogglePlayPause HomePage Favorites Search Standby OpenUrl LaunchMail
+    LaunchMedia Launch0 Launch1 Launch2 Launch3 Launch4 Launch5 Launch6 Launch7 Launch8 Launch9
+    LaunchA LaunchB LaunchC LaunchD LaunchE LaunchF MonBrightnessUp MonBrightnessDown
+    KeyboardLightOnOff KeyboardBrightnessUp KeyboardBrightnessDown PowerOff WakeUp Eject
+    ScreenSaver WWW Memo LightBulb Shop History AddFavorite HotLinks BrightnessAdjust Finance
+    Community AudioRewind BackForward ApplicationLeft ApplicationRight Book CD Calculator
+    ToDoList ClearGrab Close Copy Cut Display DOS Documents Excel Explorer Game Go iTouch
+    LogOff Market Meeting MenuKB MenuPB MySites News OfficeHome Option Paste Phone Calendar
+    Reply Reload RotateWindows RotationPB RotationKB Save Send Spell SplitScreen Support
+    TaskPane Terminal Tools Travel Video Word Xfer ZoomIn ZoomOut Away Messenger WebCam
+    MailForward Pictures Music Battery Bluetooth WLAN UWB AudioForward AudioRepeat
+    AudioRandomPlay Subtitle AudioCycleTrack Time Hibernate View TopMenu PowerDown Suspend
+    ContrastAdjust LaunchG LaunchH TouchpadToggle TouchpadOn TouchpadOff MicMute Red Green
+    Yellow Blue ChannelUp ChannelDown Guide Info Settings MicVolumeUp MicVolumeDown Keyboard
+    New Open Find Undo Redo MediaLast Select Yes No Cancel Printer Execute Sleep Play Zoom Exit
+    Context1 Context2 Context3 Context4 Call Hangup Flip ToggleCallHangup VoiceDial
+    LastNumberRedial Camera CameraFocus
+""".split()) | {f"F{n}" for n in range(1, 36)}
 
 
 SCHEMA = """
@@ -93,79 +146,108 @@ def display_title(text: str, fallback: str = "Untitled") -> str:
     return first_line[:80] or fallback
 
 
-def parse_legacy_content(content: str) -> list[tuple[str, str]]:
-    sections = re.split(r"(?m)^#\s+", content)
-    items: list[tuple[str, str]] = []
-    for section in sections:
-        if not section.strip():
-            continue
-        title, separator, body = section.strip().partition("\n")
-        items.append((title.strip(), body.strip() if separator else ""))
-    return items
+def key_binding(spec: object) -> tuple[frozenset[str], str] | None:
+    """Validate a key spec and normalize equivalent spellings for conflict checks."""
+    if not isinstance(spec, str) or not spec:
+        return None
+    if spec.endswith("+"):
+        prefix, key = spec[:-1], "+"
+        if prefix and not prefix.endswith("+"):
+            return None
+        modifiers = prefix[:-1].split("+") if prefix else []
+    else:
+        *modifiers, key = spec.split("+")
+    flags = frozenset(modifiers)
+    if len(flags) != len(modifiers) or not flags <= KEY_MODIFIERS:
+        return None
+    if not (len(key) == 1 and key.isprintable()) and key not in QT_KEYS:
+        return None
+    if key == "Backtab":
+        key, flags = "Tab", flags | {"Shift"}
+    if re.fullmatch(r"[A-Za-z]", key) and flags & {"Ctrl", "Alt", "Super"}:
+        key = key.upper()
+    return flags, key
 
 
-def legacy_documents() -> list[tuple[Path, str]]:
-    if LEGACY_DIR.is_dir():
-        files = sorted(path for path in LEGACY_DIR.glob("*.md") if path.is_file())
-        if files:
-            return [(path, path.read_text(encoding="utf-8")) for path in files]
-
-    repository = Path.home() / ".dotfiles"
-    documents: list[tuple[Path, str]] = []
-    for name in ("1_prompts.md", "2_snippets.md", "3_emails.md", "4_commands.md"):
-        result = subprocess.run(
-            ["git", "-C", str(repository), "show", f"HEAD:home/.config/snip/{name}"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            documents.append((Path(name), result.stdout))
-    return documents
+def command_text(value: object) -> bool:
+    return isinstance(value, str) and "\0" not in value and all(
+        not 0xD800 <= ord(char) <= 0xDFFF for char in value
+    )
 
 
-def category_name(path: Path) -> str:
-    stem = re.sub(r"^\d+[_-]?", "", path.stem)
-    return stem.replace("_", " ").replace("-", " ").strip().title() or path.stem.title()
+def editor_argv(value: str) -> list[str]:
+    if command_text(value):
+        try:
+            argv = shlex.split(value)
+            if argv and argv[0]:
+                return argv
+        except ValueError:
+            pass
+    return []
 
 
-def migrate_legacy(connection: sqlite3.Connection) -> int:
-    migrated = connection.execute(
-        "SELECT value FROM metadata WHERE key = 'legacy_migrated'"
-    ).fetchone()
-    if migrated is not None:
-        return 0
+def load_config() -> dict[str, object]:
+    config = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    warnings = []
+    try:
+        user = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        if not isinstance(user, dict):
+            warnings.append("Config must be a JSON object; using defaults")
+            user = {}
+    except FileNotFoundError:
+        user = {}
+    except (OSError, ValueError, RecursionError):
+        warnings.append("Could not read config as JSON; using defaults")
+        user = {}
 
-    count = 0
-    documents = legacy_documents()
-    with connection:
-        for order, (path, content) in enumerate(documents, start=1):
-            name = category_name(path)
-            cursor = connection.execute(
-                "INSERT INTO categories(name, sort_order) VALUES (?, ?) "
-                "ON CONFLICT(name) DO UPDATE SET sort_order = excluded.sort_order "
-                "RETURNING id",
-                (name, order),
-            )
-            category_id = cursor.fetchone()[0]
-            for title, body in parse_legacy_content(content):
-                result = connection.execute(
-                    "INSERT OR IGNORE INTO items "
-                    "(category_id, kind, title, body, content_hash) VALUES (?, 'text', ?, ?, ?)",
-                    (category_id, title, body, content_hash("text", body, "")),
-                )
-                count += result.rowcount
+    for key, value in user.items():
+        if key not in config:
+            warnings.append(f"Unknown config option: {key!r}")
+        elif key == "keys":
+            if not isinstance(value, dict):
+                warnings.append("keys must be an object; using defaults")
+                continue
+            for action, specs in value.items():
+                if action not in config["keys"]:
+                    warnings.append(f"Unknown key action: {action!r}")
+                elif not isinstance(specs, list) or any(key_binding(spec) is None for spec in specs):
+                    warnings.append(f"keys.{action} must be a list of key specs; using defaults")
+                else:
+                    config["keys"][action] = specs
+        elif key == "startInSearch" and isinstance(value, bool):
+            config[key] = value
+        elif key == "terminal" and isinstance(value, list) and (
+            not value or (value[0] and all(command_text(arg) for arg in value))
+        ):
+            config[key] = value
+        elif key == "editor" and (value == "" or (isinstance(value, str) and editor_argv(value))):
+            config[key] = value
+        else:
+            warnings.append(f"Invalid {key}; using default")
 
-        if not documents:
-            for order, name in enumerate(("Prompts", "Snippets", "Emails", "Commands"), start=1):
-                connection.execute(
-                    "INSERT OR IGNORE INTO categories(name, sort_order) VALUES (?, ?)",
-                    (name, order),
-                )
+    bindings = {}
+    for action, specs in config["keys"].items():
+        for spec in specs:
+            first = bindings.setdefault(key_binding(spec), action)
+            if first != action:
+                warnings.append(f"Key {spec!r} is bound to both {first} and {action}; {first} wins")
 
-        connection.execute(
-            "INSERT INTO metadata(key, value) VALUES ('legacy_migrated', CURRENT_TIMESTAMP)"
-        )
-    return count
+    return {
+        **config,
+        "configFile": str(CONFIG_FILE),
+        "hasDefaultTerminal": shutil.which("xdg-terminal-exec") is not None,
+        "warnings": warnings,
+    }
+
+
+def resolve_editor() -> list[str]:
+    commands = (load_config()["editor"], os.environ.get("VISUAL", ""),
+                os.environ.get("EDITOR", ""), "nvim", "vim", "nano")
+    for command in commands:
+        argv = editor_argv(command)
+        if argv and shutil.which(argv[0]):
+            return argv
+    raise ValueError("No editor found; set editor in Snip's config, VISUAL, or EDITOR")
 
 
 def load_clipboard() -> list[dict[str, object]]:
@@ -285,7 +367,12 @@ def snapshot(connection: sqlite3.Connection) -> dict[str, object]:
         body = item["body"]
         lines = [line.strip() for line in body.splitlines() if line.strip()]
         item["subtitle"] = lines[0][:100] if lines else item["categoryName"]
-    return {"categories": categories, "items": items, "inbox": load_clipboard()}
+    return {
+        "categories": categories,
+        "items": items,
+        "inbox": load_clipboard(),
+        "clipboardFile": str(CLIPBOARD_HISTORY),
+    }
 
 
 def current_clipboard_text() -> str:
@@ -304,7 +391,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Manage the Snip library")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("snapshot")
-    subparsers.add_parser("migrate")
+    subparsers.add_parser(
+        "config",
+        help="show effective settings and warnings as JSON",
+        description="Show defaults merged with the optional Snip config.json.",
+        epilog=(
+            "Key specs use Ctrl, Alt, Shift, and Super plus a printable character or a Qt key "
+            "name without Key_. Qt resolves named keys and requires exact modifiers. For "
+            "printable keys without Ctrl, Alt or Super, Shift is only required when written "
+            "explicitly; text still matches case-sensitively, so G and Shift+G both match a "
+            "shifted G. With Ctrl, Alt or Super, modifiers are exact and ASCII letters are "
+            "case-insensitive. The backend warns about duplicate bindings across actions; "
+            "the first eligible action in default keymap order wins. In search and new-tab "
+            "input, plain printable keys are not action shortcuts. Digits 0–9 jump to tabs "
+            "when neither modal is open."
+        ),
+    )
 
     pin = subparsers.add_parser("pin-inbox")
     pin.add_argument("history_index", type=int)
@@ -357,7 +459,7 @@ def main() -> int:
     if len(sys.argv) == 1:
         try:
             return subprocess.run(
-                ["omarchy-shell", "shell", "toggle", "nox.snip", "{}"],
+                ["omarchy-shell", "shell", "toggle", "themaxcoder.snip", "{}"],
                 check=False,
             ).returncode
         except OSError as error:
@@ -366,12 +468,12 @@ def main() -> int:
 
     args = build_parser().parse_args()
     try:
+        if args.command == "config":
+            output(load_config())
+            return 0
         with connect() as connection:
-            migrate_legacy(connection)
             if args.command == "snapshot":
                 output(snapshot(connection))
-            elif args.command == "migrate":
-                output({"ok": True, "database": str(DATABASE)})
             elif args.command == "pin-inbox":
                 output(
                     {
@@ -462,6 +564,7 @@ def main() -> int:
                     raise ValueError("snippet no longer exists")
                 if item["kind"] != "text":
                     raise ValueError("image entries cannot be edited as text")
+                editor = resolve_editor()
                 runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
                 with tempfile.NamedTemporaryFile(
                     mode="w",
@@ -474,9 +577,6 @@ def main() -> int:
                     temporary.write(f"# {item['title']}\n\n{item['body']}\n")
                     edit_path = Path(temporary.name)
                 try:
-                    editor = shlex.split(os.environ.get("EDITOR", "nvim"))
-                    if not editor:
-                        editor = ["nvim"]
                     result = subprocess.run([*editor, str(edit_path)], check=False)
                     if result.returncode != 0:
                         raise ValueError("editor exited without saving")

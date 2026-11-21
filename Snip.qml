@@ -3,7 +3,9 @@ import Quickshell.Io
 import Quickshell.Wayland
 import QtQuick
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
+import "Keys.js" as KeyBindings
 
 Item {
   id: root
@@ -12,6 +14,14 @@ Item {
   property string homePath: Quickshell.env("HOME")
   property var shell: null
   property var manifest: null
+  readonly property string backendPath: manifest && manifest.__sourceDir ? manifest.__sourceDir + "/bin/snip" : ""
+  property string clipboardFile: ""
+  property var config: ({})
+  readonly property var keymap: config.keys || ({})
+  readonly property var searchKeys: KeyBindings.keymapFor(keymap, ["up", "down", "paste", "copy", "back"], true)
+  readonly property var savePickerKeys: KeyBindings.keymapFor(keymap, ["up", "down", "paste", "back"], false)
+  readonly property var categoryInputKeys: KeyBindings.keymapFor(keymap, ["paste", "back"], true)
+  property bool startModePending: false
 
   property bool opened: false
   property bool searchMode: false
@@ -35,25 +45,25 @@ Item {
   property string processOutput: ""
   property string processError: ""
 
-  property color background: Color.menu.background
-  property color foreground: Color.menu.text
-  property color border: Color.menu.border
+  property color background: Commons.Color.menu.background
+  property color foreground: Commons.Color.menu.text
+  property color border: Commons.Color.menu.border
   property var borderSpec: Border.surfaceSpec("menu", "border", border, Math.max(1, Style.space(2)))
-  property color scrim: Color.menu.scrim
-  property color selectedBackground: Color.menu.selectedBackground
-  property color selectedText: Color.menu.selectedText
-  property color accent: Color.accent
-  property color urgent: Color.urgent
-  property color muted: Color.muted
-  property color success: Color.accent
-  property color warning: Color.accent
-  property color danger: Color.urgent
-  property color info: Color.accent
-  property color navigation: Color.accent
-  property color navigationBackground: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16)
+  property color scrim: Commons.Color.menu.scrim
+  property color selectedBackground: Commons.Color.menu.selectedBackground
+  property color selectedText: Commons.Color.menu.selectedText
+  property color accent: Commons.Color.accent
+  property color urgent: Commons.Color.urgent
+  property color muted: Commons.Color.muted
+  property color success: Commons.Color.accent
+  property color warning: Commons.Color.accent
+  property color danger: Commons.Color.urgent
+  property color info: Commons.Color.accent
+  property color navigation: Commons.Color.accent
+  property color navigationBackground: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.16)
   property color navigationTabBackground: navigationRowBackground
-  property color navigationRowBackground: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.05)
-  property color navigationBorder: Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.12)
+  property color navigationRowBackground: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.05)
+  property color navigationBorder: Qt.rgba(Commons.Color.accent.r, Commons.Color.accent.g, Commons.Color.accent.b, 0.12)
   readonly property color statusColor: statusTone === "success" ? success
     : (statusTone === "warning" ? warning : (statusTone === "danger" ? danger : accent))
   readonly property color translucentBackground: background
@@ -76,39 +86,80 @@ Item {
     return body.length > 12000 ? body.slice(0, 12000) + "\n\n[Preview truncated · copy or edit for full text]" : body
   }
 
-  function open(payloadJson) {
-    root.searchMode = false
-    root.searchText = ""
-    root.currentTab = 0
-    root.selectedIndex = 0
-    root.cursorActive = true
-    root.savePickerOpen = false
-    root.categoryInputOpen = false
-    root.statusText = ""
-    root.rebuildDisplay()
+  function open(payload) {
+    root.close(null)
+    root.searchMode = Boolean(root.config.startInSearch)
+    root.startModePending = true
     root.resetSelectionOnSnapshot = true
     root.opened = true
     themeColors.reload()
-    root.runBackend(["snapshot"], "snapshot")
-    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+    Qt.callLater(function() { if (root.opened) keyCatcher.forceActiveFocus() })
+    if (!root.checkBackendPath()) return
+    configTimer.restart()
+    refreshTimer.restart()
   }
 
-  function close() {
+  function close(payload) {
     root.opened = false
+    root.startModePending = false
+    root.searchMode = false
+    root.searchText = ""
+    root.currentTab = 0
+    root.categories = []
+    root.savedItems = []
+    root.inboxItems = []
+    root.displayRows = []
+    root.updateSelection(0)
+    root.cursorActive = false
+    root.savePickerOpen = false
+    root.saveCategoryIndex = 0
+    root.categoryInputOpen = false
+    root.categoryInputForSave = false
+    root.categoryInput = ""
+    root.statusText = ""
+    root.statusTone = "accent"
+    root.deleteArmedId = -1
+    root.deleteArmedCategoryId = -1
+    refreshTimer.stop()
+    statusTimer.stop()
+    deleteTimer.stop()
   }
 
   function dismiss() {
-    root.opened = false
+    root.close(null)
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "nox.snip")
+      root.shell.hide((root.manifest && root.manifest.id) || "themaxcoder.snip")
   }
 
-  function toggle() {
-    if (root.opened) root.dismiss()
-    else root.open("{}")
+  function checkBackendPath() {
+    if (root.backendPath) return true
+    statusTimer.stop()
+    root.statusText = "Cannot locate Snip: the plugin manifest has no install directory (__sourceDir)"
+    root.statusTone = "danger"
+    return false
+  }
+
+  function applyConfig(raw) {
+    try {
+      root.config = JSON.parse(raw)
+    } catch (error) {
+      if (root.opened) root.status("Could not read Snip configuration", "danger")
+      return
+    }
+    if (root.startModePending) {
+      root.startModePending = false
+      if (root.searchMode !== root.config.startInSearch) {
+        root.searchMode = root.config.startInSearch
+        root.selectedIndex = 0
+        root.rebuildDisplay()
+      }
+    }
+    if (root.opened && root.config.warnings.length)
+      root.status(root.config.warnings.join(" · "), "warning")
   }
 
   function runBackend(args, action) {
+    if (!root.checkBackendPath()) return false
     if (backend.running) {
       root.status("Still working…", "warning")
       return false
@@ -116,7 +167,7 @@ Item {
     root.pendingAction = action
     root.processOutput = ""
     root.processError = ""
-    backend.command = [root.homePath + "/.local/bin/snip"].concat(args)
+    backend.command = [root.backendPath].concat(args)
     backend.running = true
     return true
   }
@@ -124,6 +175,7 @@ Item {
   function applySnapshot(raw) {
     try {
       var data = JSON.parse(raw)
+      root.clipboardFile = data.clipboardFile || ""
       root.categories = data.categories || []
       root.savedItems = data.items || []
       root.inboxItems = data.inbox || []
@@ -140,6 +192,29 @@ Item {
     root.statusText = message
     root.statusTone = tone || "accent"
     statusTimer.restart()
+  }
+
+  function keyHint(keymap, actions) {
+    var specs = actions.map(function(action) { return (keymap[action] || [])[0] })
+      .filter(Boolean).map(KeyBindings.hint)
+    return specs.length ? "[" + specs.join("/") + "]" : ""
+  }
+
+  function hints(keymap, labels) {
+    return labels.map(function(pair) {
+      var key = root.keyHint(keymap, pair.slice(1))
+      return key ? key + " " + pair[0] : ""
+    }).filter(Boolean).join("   ")
+  }
+
+  function footerHint() {
+    if (root.searchMode)
+      return root.hints(root.searchKeys, [["move", "up", "down"], ["paste", "paste"],
+        ["copy", "copy"], [root.searchText ? "clear search" : "navigation", "back"]])
+    return root.hints(root.keymap, [["tabs", "prevTab", "nextTab"], ["move", "up", "down"],
+      ["ends", "first", "last"], ["pin", "pin"], ["save", "save"], ["edit", "edit"],
+      ["delete", "delete"], ["tab +/−", "newTab", "deleteTab"], ["search", "search"],
+      ["paste", "paste"], ["copy", "copy"], ["close", "back", "close"]])
   }
 
   function loadThemePalette(raw) {
@@ -261,6 +336,18 @@ Item {
     })
   }
 
+  function back() {
+    root.startModePending = false
+    if (!root.searchMode) {
+      root.dismiss()
+      return
+    }
+    if (root.searchText) root.searchText = ""
+    else root.searchMode = false
+    root.selectedIndex = 0
+    root.rebuildDisplay()
+  }
+
   function tabName(index) {
     if (index === 0) return "Inbox"
     if (index === 1) return "Pinned"
@@ -300,7 +387,7 @@ Item {
 
   function pasteSelected(copyOnly) {
     var row = root.selectedItem
-    if (!row) return
+    if (!row || !root.checkBackendPath()) return
     var command
     if (row.kind === "image") {
       command = [root.omarchyPath + "/bin/omarchy-clipboard-paste-file"]
@@ -315,7 +402,7 @@ Item {
     }
 
     if (row.source === "saved")
-      Quickshell.execDetached([root.homePath + "/.local/bin/snip", "used", String(row.itemId)])
+      Quickshell.execDetached([root.backendPath, "used", String(row.itemId)])
     if (!copyOnly) root.dismiss()
     else root.status("Copied", "success")
     Quickshell.execDetached(command)
@@ -325,8 +412,10 @@ Item {
     var row = root.selectedItem
     if (!row) return
     if (row.source === "inbox") {
-      if (root.runBackend(["pin-inbox", String(row.historyIndex)], "mutate"))
-        root.status("Pinned · [s] choose or create a tab", "success")
+      if (root.runBackend(["pin-inbox", String(row.historyIndex)], "mutate")) {
+        var save = root.keyHint(root.keymap, ["save"])
+        root.status("Pinned" + (save ? " · " + save + " choose or create a tab" : ""), "success")
+      }
     } else {
       if (root.runBackend(["toggle-pin", String(row.itemId)], "mutate"))
         root.status(row.pinned ? "Unpinned" : "Pinned", row.pinned ? "warning" : "success")
@@ -361,7 +450,7 @@ Item {
     if (!row || row.source !== "saved") return
     if (root.deleteArmedId !== row.itemId) {
       root.deleteArmedId = row.itemId
-      root.status("Press d again to delete", "danger")
+      root.status("Press " + root.keyHint(root.keymap, ["delete"]) + " again to delete", "danger")
       deleteTimer.restart()
       return
     }
@@ -379,7 +468,8 @@ Item {
     if (!category) return
     if (root.deleteArmedCategoryId !== Number(category.id)) {
       root.deleteArmedCategoryId = Number(category.id)
-      root.status("Delete “" + category.name + "”? Press D again · snippets move to Pinned", "danger")
+      root.status("Delete “" + category.name + "”? Press " + root.keyHint(root.keymap, ["deleteTab"])
+        + " again · snippets move to Pinned", "danger")
       deleteTimer.restart()
       return
     }
@@ -400,11 +490,17 @@ Item {
       root.status("Images cannot be edited as text", "warning")
       return
     }
+    if (!root.checkBackendPath()) return
+    var terminal = root.config.terminal
+    if (!terminal || !terminal.length) {
+      if (!root.config.hasDefaultTerminal) {
+        root.status("xdg-terminal-exec not found; set terminal in Snip's config", "danger")
+        return
+      }
+      terminal = ["xdg-terminal-exec", "--app-id=TUI.float", "--title=Edit Snip", "--"]
+    }
     root.dismiss()
-    Quickshell.execDetached([
-      "foot", "--app-id=snip-editor", "--title=Edit Snip", "-e",
-      root.homePath + "/.local/bin/snip", "edit", String(row.itemId)
-    ])
+    Quickshell.execDetached(terminal.concat([root.backendPath, "edit", String(row.itemId)]))
   }
 
   function createCategory() {
@@ -436,6 +532,7 @@ Item {
     onExited: function(exitCode) {
       var action = root.pendingAction
       root.pendingAction = ""
+      if (!root.opened) return
       if (exitCode !== 0) {
         root.status(root.processError.trim() || "Snip operation failed", "danger")
         return
@@ -445,11 +542,35 @@ Item {
     }
   }
 
+  Process {
+    id: configReader
+    command: [root.backendPath, "config"]
+    stdout: StdioCollector { id: configOutput }
+    stderr: StdioCollector { id: configError }
+    onExited: function(exitCode) {
+      if (exitCode === 0) root.applyConfig(configOutput.text)
+      else if (root.opened) root.status(configError.text.trim() || "Could not load Snip configuration", "danger")
+    }
+  }
+
   FileView {
-    path: root.homePath + "/.local/state/omarchy/clipboard-history.json"
+    path: root.config.configFile || ""
     watchChanges: true
     printErrors: false
-    onFileChanged: if (root.opened) refreshTimer.restart()
+    onFileChanged: {
+      reload()
+      configTimer.restart()
+    }
+  }
+
+  FileView {
+    path: root.clipboardFile
+    watchChanges: true
+    printErrors: false
+    onFileChanged: {
+      reload()
+      if (root.opened) refreshTimer.restart()
+    }
   }
 
   FileView {
@@ -462,9 +583,22 @@ Item {
   }
 
   Timer {
+    id: configTimer
+    interval: 80
+    onTriggered: {
+      if (configReader.running) restart()
+      else if (root.backendPath) configReader.running = true
+    }
+  }
+
+  Timer {
     id: refreshTimer
     interval: 80
-    onTriggered: root.runBackend(["snapshot"], "snapshot")
+    onTriggered: {
+      if (!root.opened) return
+      if (backend.running) restart()
+      else root.runBackend(["snapshot"], "snapshot")
+    }
   }
 
   Timer {
@@ -490,7 +624,7 @@ Item {
     visible: root.opened
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
-    WlrLayershell.namespace: "nox-snip"
+    WlrLayershell.namespace: "snip"
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
     exclusionMode: ExclusionMode.Ignore
@@ -524,99 +658,84 @@ Item {
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
+          event.accepted = true
           if (root.savePickerOpen) {
-            if (event.key === Qt.Key_Escape) root.savePickerOpen = false
-            else if (event.key === Qt.Key_Up || event.text === "o" || event.text === "k")
-              root.saveCategoryIndex = (root.saveCategoryIndex - 1 + root.categories.length + 1) % (root.categories.length + 1)
-            else if (event.key === Qt.Key_Down || event.text === "a" || event.text === "j")
-              root.saveCategoryIndex = (root.saveCategoryIndex + 1) % (root.categories.length + 1)
-            else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) root.saveToCategory()
-            event.accepted = true
+            var saveAction = KeyBindings.actionFor(event, root.savePickerKeys)
+            var choices = root.categories.length + 1
+            if (saveAction === "back") root.savePickerOpen = false
+            else if (saveAction === "up") root.saveCategoryIndex = (root.saveCategoryIndex - 1 + choices) % choices
+            else if (saveAction === "down") root.saveCategoryIndex = (root.saveCategoryIndex + 1) % choices
+            else if (saveAction === "paste") root.saveToCategory()
             return
           }
 
           if (root.categoryInputOpen) {
-            if (event.key === Qt.Key_Escape) {
+            var inputAction = KeyBindings.actionFor(event, root.categoryInputKeys)
+            if (inputAction === "back") {
               root.categoryInputOpen = false
               root.categoryInputForSave = false
               root.categoryInput = ""
-            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+            } else if (inputAction === "paste") {
               root.createCategory()
             } else if (Util.editsFilter(event, root.categoryInput)) {
               root.categoryInput = Util.editedFilter(event, root.categoryInput)
-            } else if (event.text && event.text.length === 1
-                       && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
-              root.categoryInput += event.text
+            } else {
+              root.categoryInput += KeyBindings.printableText(event)
             }
-            event.accepted = true
             return
           }
 
-          if (event.matches(StandardKey.Copy)
-              || (event.key === Qt.Key_C && event.modifiers === Qt.MetaModifier)) {
-            root.pasteSelected(true)
-            event.accepted = true
-            return
-          }
-
-          if (root.searchMode) {
-            if (event.key === Qt.Key_Escape) {
+          var tab = KeyBindings.tabDigit(event)
+          if (tab >= 0) {
+            if (tab < root.tabCount) {
+              root.startModePending = false
               root.searchMode = false
               root.searchText = ""
+              root.currentTab = tab
               root.selectedIndex = 0
-              root.rebuildDisplay()
-            } else if (event.key === Qt.Key_Up) {
-              root.select(-1)
-            } else if (event.key === Qt.Key_Down) {
-              root.select(1)
-            } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-              root.pasteSelected(false)
-            } else if (Util.editsFilter(event, root.searchText)) {
-              root.searchText = Util.editedFilter(event, root.searchText)
-              root.selectedIndex = 0
-              root.rebuildDisplay()
-            } else if (event.text && event.text.length === 1
-                       && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
-              root.searchText += event.text
-              root.selectedIndex = 0
+              root.deleteArmedId = -1
+              root.deleteArmedCategoryId = -1
               root.rebuildDisplay()
             }
-            event.accepted = true
             return
           }
 
-          if (event.key === Qt.Key_Escape || event.text === "q") root.dismiss()
-          else if (event.key === Qt.Key_Right || event.key === Qt.Key_Tab || event.text === "e") root.switchTab(1)
-          else if (event.key === Qt.Key_Left || event.key === Qt.Key_Backtab || event.text === "h") root.switchTab(-1)
-          else if (event.key === Qt.Key_Up || event.text === "o" || event.text === "k") root.select(-1)
-          else if (event.key === Qt.Key_Down || event.text === "a" || event.text === "j") root.select(1)
-          else if (event.key === Qt.Key_Home || event.text === "g") root.selectAbsolute(0)
-          else if (event.key === Qt.Key_End || event.text === "G") root.selectAbsolute(root.displayRows.length - 1)
-          else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.text === "p") root.pasteSelected(false)
-          else if (event.text === "y") root.pasteSelected(true)
-          else if (event.text === "f") root.quickPin()
-          else if (event.text === "s") root.openSavePicker()
-          else if (event.text === "d") root.deleteSelected()
-          else if (event.text === "D") root.deleteCurrentTab()
-          else if (event.text === "i") root.editSelected()
-          else if (event.text === "N") {
+          var action = KeyBindings.actionFor(event, root.searchMode ? root.searchKeys : root.keymap)
+          if (action === "back") root.back()
+          else if (action === "up") root.select(-1)
+          else if (action === "down") root.select(1)
+          else if (action === "paste") root.pasteSelected(false)
+          else if (action === "copy") root.pasteSelected(true)
+          else if (root.searchMode) {
+            var query = Util.editsFilter(event, root.searchText)
+              ? Util.editedFilter(event, root.searchText)
+              : root.searchText + KeyBindings.printableText(event)
+            if (query !== root.searchText) {
+              root.searchText = query
+              root.selectedIndex = 0
+              root.rebuildDisplay()
+            }
+          } else if (action === "close") root.dismiss()
+          else if (action === "nextTab") root.switchTab(1)
+          else if (action === "prevTab") root.switchTab(-1)
+          else if (action === "first") root.selectAbsolute(0)
+          else if (action === "last") root.selectAbsolute(root.displayRows.length - 1)
+          else if (action === "pin") root.quickPin()
+          else if (action === "save") root.openSavePicker()
+          else if (action === "delete") root.deleteSelected()
+          else if (action === "deleteTab") root.deleteCurrentTab()
+          else if (action === "edit") root.editSelected()
+          else if (action === "newTab") {
             root.categoryInput = ""
             root.categoryInputForSave = false
             root.categoryInputOpen = true
-          } else if (event.text === "/") {
+          } else if (action === "search") {
+            root.startModePending = false
             root.searchMode = true
             root.searchText = ""
             root.selectedIndex = 0
             root.rebuildDisplay()
-          } else if (event.text && /^[0-9]$/.test(event.text)) {
-            var tab = Number(event.text)
-            if (tab < root.tabCount) {
-              root.currentTab = tab
-              root.selectedIndex = 0
-              root.rebuildDisplay()
-            }
           }
-          event.accepted = true
         }
       }
 
@@ -890,17 +1009,20 @@ Item {
 
           Text {
             anchors.left: parent.left
+            anchors.right: pinnedHint.left
+            anchors.rightMargin: Style.spacing.sm
             anchors.verticalCenter: parent.verticalCenter
-            text: root.statusText || (root.searchMode
-              ? "[Esc] navigation   [↑/↓] move   [Enter] paste   [Super+C] copy"
-              : "[h/e] tabs   [o/a] move   [f] pin   [s] save   [i] edit   [N/D] tab +/-   [/] search   [p/↵] paste   [y/Super+C] copy   [q] close")
+            text: root.statusText || root.footerHint()
+            textFormat: Text.PlainText
             color: root.statusText ? root.statusColor : root.foreground
             opacity: root.statusText ? 1.0 : 0.65
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
           }
 
           Text {
+            id: pinnedHint
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             text: root.selectedItem && root.selectedItem.source === "saved" && root.selectedItem.pinned ? "󰐃 pinned" : ""
@@ -980,7 +1102,9 @@ Item {
 
           Text {
             width: parent.width
-            text: "[Enter] confirm   [Esc] cancel"
+            text: root.categoryInputOpen
+              ? root.hints(root.categoryInputKeys, [["confirm", "paste"], ["cancel", "back"]])
+              : root.hints(root.savePickerKeys, [["move", "up", "down"], ["confirm", "paste"], ["cancel", "back"]])
             color: root.foreground
             opacity: 0.5
             font.family: root.fontFamily

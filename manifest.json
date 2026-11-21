@@ -1,10 +1,10 @@
 {
   "schemaVersion": 1,
-  "id": "nox.snip",
+  "id": "themaxcoder.snip",
   "name": "Snip",
   "version": "1.0.0",
-  "author": "nox",
-  "description": "Navigation-first snippet and clipboard picker",
+  "author": "TheMaxCoder",
+  "description": "Keyboard-first snippet and clipboard picker",
   "kinds": [
     "overlay"
   ],
