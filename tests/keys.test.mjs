@@ -24,7 +24,8 @@ const Qt = {
 const context = createContext({ Qt });
 const source = readFileSync(new URL('../Keys.js', import.meta.url), 'utf8');
 runInContext(source.replace(/^\.pragma library\r?\n/, ''), context);
-const { parseSpec, matches, actionFor, keymapFor, printableText, tabDigit, hint } = context;
+const { parseSpec, matches, actionFor, validatedKeymap, keymapFor, textInputAction,
+  printableText, tabDigit, hint } = context;
 const defaults = JSON.parse(readFileSync(new URL('../config.example.json', import.meta.url), 'utf8')).keys;
 const event = (key, text = '', modifiers = 0) => ({ key, text, modifiers });
 
@@ -107,6 +108,29 @@ test('save picker uses configured navigation while a new tab name can still cont
   assert.equal(actionFor(p, input), '');
   assert.equal(printableText(p), 'p');
   assert.equal(actionFor(ctrlC, input), 'back');
+});
+
+test('reports and filters unknown Qt keys without losing valid bindings', () => {
+  const warnings = ['existing warning'];
+  const map = validatedKeymap({ up: ['Foo', 'Up'], back: ['Key_Escape'] }, warnings);
+  assert.deepEqual(Array.from(map.up), ['Up']);
+  assert.equal(map.back.length, 0);
+  assert.deepEqual(warnings, ['existing warning', 'Unknown key "Foo" in keys.up',
+    'Unknown key "Key_Escape" in keys.back']);
+});
+
+test('text input reserves Return, Enter, and Escape even with conflicting or disabled bindings', () => {
+  const search = keymapFor({ up: ['Return', 'Escape'], paste: [], back: ['F1'] },
+    ['up', 'down', 'paste', 'copy', 'back'], true);
+  const newTab = keymapFor({ paste: ['Escape'], back: [] }, ['paste', 'back'], true);
+  for (const map of [search, newTab]) {
+    assert.equal(textInputAction(event(Qt.Key_Return, '\r'), map), 'paste');
+    assert.equal(textInputAction(event(Qt.Key_Enter, '\r', Qt.KeypadModifier), map), 'paste');
+    assert.equal(textInputAction(event(Qt.Key_Escape), map), 'back');
+    assert.equal(map.paste[0], 'Return');
+    assert.equal(map.back[0], 'Escape');
+  }
+  assert.equal(textInputAction(event(Qt.Key_F1), search), 'back');
 });
 
 test('formats readable hints for named keys and leaves bindings intact', () => {

@@ -89,6 +89,7 @@ Item {
   function open(payload) {
     root.close(null)
     root.searchMode = Boolean(root.config.startInSearch)
+    root.rebuildDisplay()
     root.startModePending = true
     root.resetSelectionOnSnapshot = true
     root.opened = true
@@ -96,7 +97,7 @@ Item {
     Qt.callLater(function() { if (root.opened) keyCatcher.forceActiveFocus() })
     if (!root.checkBackendPath()) return
     configTimer.restart()
-    refreshTimer.restart()
+    if (!root.runBackend(["snapshot"], "snapshot")) refreshTimer.restart()
   }
 
   function close(payload) {
@@ -105,11 +106,9 @@ Item {
     root.searchMode = false
     root.searchText = ""
     root.currentTab = 0
-    root.categories = []
-    root.savedItems = []
-    root.inboxItems = []
-    root.displayRows = []
-    root.updateSelection(0)
+    root.resetSelectionOnSnapshot = false
+    root.selectedIndex = 0
+    root.selectedItem = null
     root.cursorActive = false
     root.savePickerOpen = false
     root.saveCategoryIndex = 0
@@ -120,6 +119,7 @@ Item {
     root.statusTone = "accent"
     root.deleteArmedId = -1
     root.deleteArmedCategoryId = -1
+    configTimer.stop()
     refreshTimer.stop()
     statusTimer.stop()
     deleteTimer.stop()
@@ -141,7 +141,9 @@ Item {
 
   function applyConfig(raw) {
     try {
-      root.config = JSON.parse(raw)
+      var config = JSON.parse(raw)
+      config.keys = KeyBindings.validatedKeymap(config.keys, config.warnings)
+      root.config = config
     } catch (error) {
       if (root.opened) root.status("Could not read Snip configuration", "danger")
       return
@@ -670,7 +672,7 @@ Item {
           }
 
           if (root.categoryInputOpen) {
-            var inputAction = KeyBindings.actionFor(event, root.categoryInputKeys)
+            var inputAction = KeyBindings.textInputAction(event, root.categoryInputKeys)
             if (inputAction === "back") {
               root.categoryInputOpen = false
               root.categoryInputForSave = false
@@ -700,7 +702,8 @@ Item {
             return
           }
 
-          var action = KeyBindings.actionFor(event, root.searchMode ? root.searchKeys : root.keymap)
+          var action = root.searchMode ? KeyBindings.textInputAction(event, root.searchKeys)
+            : KeyBindings.actionFor(event, root.keymap)
           if (action === "back") root.back()
           else if (action === "up") root.select(-1)
           else if (action === "down") root.select(1)

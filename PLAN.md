@@ -264,6 +264,7 @@ Node tests load the `.js` files with `vm` after stripping the `.pragma library` 
      `--primary`, which reads the selection via `wl-paste --primary`, and
      `--stdin`.
    - Options: `--category NAME` (created if missing), `--title`, `--pin`.
+   - Without `--category`, save the item uncategorized and pinned; never require a `Prompts` tab.
    - Print the new item as JSON.
    - Send a desktop notification only if `--notify` is passed (via
      `notify-send`, skipped if absent). Document a binding example.

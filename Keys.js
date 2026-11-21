@@ -80,17 +80,41 @@ function actionFor(event, keymap) {
   return ""
 }
 
+function validatedKeymap(keymap, warnings) {
+  var result = {}
+  Object.keys(keymap).forEach(function(action) {
+    result[action] = keymap[action].filter(function(spec) {
+      if (parseSpec(spec)) return true
+      warnings.push("Unknown key " + JSON.stringify(spec) + " in keys." + action)
+      return false
+    })
+  })
+  return result
+}
+
+function textInputAction(event, keymap) {
+  if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) return "paste"
+  if (event.key === Qt.Key_Escape) return "back"
+  return actionFor(event, keymap)
+}
+
 function keymapFor(keymap, allowedActions, textInput) {
   var result = {}
   Object.keys(keymap).forEach(function(action) {
     if (allowedActions.indexOf(action) === -1) return
     result[action] = !textInput ? keymap[action] : keymap[action].filter(function(spec) {
       var binding = parseSpec(spec)
-      // Plain printable keys (including Shift-produced text) belong to input.
-      return binding && ((binding.modifiers & commandModifierMask())
+      // These keys are reserved below; printable keys belong to text input.
+      if (!binding || binding.key === Qt.Key_Return || binding.key === Qt.Key_Enter
+          || binding.key === Qt.Key_Escape) return false
+      return ((binding.modifiers & commandModifierMask())
         || (binding.key !== undefined && binding.key >= Qt.Key_Escape))
     })
   })
+  if (textInput) {
+    result.paste = ["Return", "Enter"].concat(result.paste || [])
+    result.back = ["Escape"].concat(result.back || [])
+  }
   return result
 }
 

@@ -36,54 +36,6 @@ CONFIG_FILE = Path(
 ).absolute()
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.example.json"
 KEY_MODIFIERS = {"Ctrl", "Alt", "Shift", "Super"}
-# Multi-character Qt::Key names (Qt 6.12), kept here so config validation
-# does not need Python Qt bindings or a live shell. Function keys are generated.
-QT_KEYS = frozenset("""
-    Space Any Exclam QuoteDbl NumberSign Dollar Percent Ampersand Apostrophe ParenLeft
-    ParenRight Asterisk Plus Comma Minus Period Slash Colon Semicolon Less Equal Greater
-    Question At BracketLeft Backslash BracketRight AsciiCircum Underscore QuoteLeft BraceLeft
-    Bar BraceRight AsciiTilde nobreakspace exclamdown cent sterling currency yen brokenbar
-    section diaeresis copyright ordfeminine guillemotleft notsign hyphen registered macron
-    degree plusminus twosuperior threesuperior acute micro paragraph periodcentered cedilla
-    onesuperior masculine guillemotright onequarter onehalf threequarters questiondown Agrave
-    Aacute Acircumflex Atilde Adiaeresis Aring AE Ccedilla Egrave Eacute Ecircumflex Ediaeresis
-    Igrave Iacute Icircumflex Idiaeresis ETH Ntilde Ograve Oacute Ocircumflex Otilde Odiaeresis
-    multiply Ooblique Ugrave Uacute Ucircumflex Udiaeresis Yacute THORN ssharp division
-    ydiaeresis Escape Tab Backtab Backspace Return Enter Insert Delete Pause Print SysReq Clear
-    Home End Left Up Right Down PageUp PageDown Shift Control Meta Alt CapsLock NumLock
-    ScrollLock Super_L Super_R Menu Hyper_L Hyper_R Help Direction_L Direction_R AltGr
-    Multi_key Codeinput SingleCandidate MultipleCandidate PreviousCandidate Mode_switch Kanji
-    Muhenkan Henkan Romaji Hiragana Katakana Hiragana_Katakana Zenkaku Hankaku Zenkaku_Hankaku
-    Touroku Massyo Kana_Lock Kana_Shift Eisu_Shift Eisu_toggle Hangul Hangul_Start Hangul_End
-    Hangul_Hanja Hangul_Jamo Hangul_Romaja Hangul_Jeonja Hangul_Banja Hangul_PreHanja
-    Hangul_PostHanja Hangul_Special Dead_Grave Dead_Acute Dead_Circumflex Dead_Tilde
-    Dead_Macron Dead_Breve Dead_Abovedot Dead_Diaeresis Dead_Abovering Dead_Doubleacute
-    Dead_Caron Dead_Cedilla Dead_Ogonek Dead_Iota Dead_Voiced_Sound Dead_Semivoiced_Sound
-    Dead_Belowdot Dead_Hook Dead_Horn Dead_Stroke Dead_Abovecomma Dead_Abovereversedcomma
-    Dead_Doublegrave Dead_Belowring Dead_Belowmacron Dead_Belowcircumflex Dead_Belowtilde
-    Dead_Belowbreve Dead_Belowdiaeresis Dead_Invertedbreve Dead_Belowcomma Dead_Currency Dead_a
-    Dead_A Dead_e Dead_E Dead_i Dead_I Dead_o Dead_O Dead_u Dead_U Dead_Small_Schwa
-    Dead_Capital_Schwa Dead_Greek Dead_Lowline Dead_Aboveverticalline Dead_Belowverticalline
-    Dead_Longsolidusoverlay Back Forward Stop Refresh VolumeDown VolumeMute VolumeUp BassBoost
-    BassUp BassDown TrebleUp TrebleDown MediaPlay MediaStop MediaPrevious MediaNext MediaRecord
-    MediaPause MediaTogglePlayPause HomePage Favorites Search Standby OpenUrl LaunchMail
-    LaunchMedia Launch0 Launch1 Launch2 Launch3 Launch4 Launch5 Launch6 Launch7 Launch8 Launch9
-    LaunchA LaunchB LaunchC LaunchD LaunchE LaunchF MonBrightnessUp MonBrightnessDown
-    KeyboardLightOnOff KeyboardBrightnessUp KeyboardBrightnessDown PowerOff WakeUp Eject
-    ScreenSaver WWW Memo LightBulb Shop History AddFavorite HotLinks BrightnessAdjust Finance
-    Community AudioRewind BackForward ApplicationLeft ApplicationRight Book CD Calculator
-    ToDoList ClearGrab Close Copy Cut Display DOS Documents Excel Explorer Game Go iTouch
-    LogOff Market Meeting MenuKB MenuPB MySites News OfficeHome Option Paste Phone Calendar
-    Reply Reload RotateWindows RotationPB RotationKB Save Send Spell SplitScreen Support
-    TaskPane Terminal Tools Travel Video Word Xfer ZoomIn ZoomOut Away Messenger WebCam
-    MailForward Pictures Music Battery Bluetooth WLAN UWB AudioForward AudioRepeat
-    AudioRandomPlay Subtitle AudioCycleTrack Time Hibernate View TopMenu PowerDown Suspend
-    ContrastAdjust LaunchG LaunchH TouchpadToggle TouchpadOn TouchpadOff MicMute Red Green
-    Yellow Blue ChannelUp ChannelDown Guide Info Settings MicVolumeUp MicVolumeDown Keyboard
-    New Open Find Undo Redo MediaLast Select Yes No Cancel Printer Execute Sleep Play Zoom Exit
-    Context1 Context2 Context3 Context4 Call Hangup Flip ToggleCallHangup VoiceDial
-    LastNumberRedial Camera CameraFocus
-""".split()) | {f"F{n}" for n in range(1, 36)}
 
 
 SCHEMA = """
@@ -147,7 +99,7 @@ def display_title(text: str, fallback: str = "Untitled") -> str:
 
 
 def key_binding(spec: object) -> tuple[frozenset[str], str] | None:
-    """Validate a key spec and normalize equivalent spellings for conflict checks."""
+    """Check spec structure and normalize bindings; Qt validates the key itself."""
     if not isinstance(spec, str) or not spec:
         return None
     if spec.endswith("+"):
@@ -159,8 +111,6 @@ def key_binding(spec: object) -> tuple[frozenset[str], str] | None:
         *modifiers, key = spec.split("+")
     flags = frozenset(modifiers)
     if len(flags) != len(modifiers) or not flags <= KEY_MODIFIERS:
-        return None
-    if not (len(key) == 1 and key.isprintable()) and key not in QT_KEYS:
         return None
     if key == "Backtab":
         key, flags = "Tab", flags | {"Shift"}
@@ -403,7 +353,8 @@ def build_parser() -> argparse.ArgumentParser:
             "shifted G. With Ctrl, Alt or Super, modifiers are exact and ASCII letters are "
             "case-insensitive. The backend warns about duplicate bindings across actions; "
             "the first eligible action in default keymap order wins. In search and new-tab "
-            "input, plain printable keys are not action shortcuts. Digits 0–9 jump to tabs "
+            "input, Return/Enter confirm and Escape goes back regardless of settings; plain "
+            "printable keys are not action shortcuts. Digits 0–9 jump to tabs "
             "when neither modal is open."
         ),
     )

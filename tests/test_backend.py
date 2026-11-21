@@ -176,13 +176,20 @@ class BackendTests(unittest.TestCase):
             "terminal": ["terminal", 1],
             "editor": "'unterminated",
             "keys": {"up": "Up", "down": ["Hyper+J"], "paste": ["F2", None],
-                     "copy": ["Key_C"], "back": ["NoSuchQtKey"], "close": ["Ctrl+"], "noAction": []},
+                     "copy": ["Ctrl+Ctrl+C"], "back": [""], "close": ["Ctrl+"], "noAction": []},
         })
         config = self.snip("config")
         self.assertEqual({key: config[key] for key in DEFAULTS}, DEFAULTS)
         for option in ("extra", "startInSearch", "terminal", "editor", "keys.up", "keys.down",
                        "keys.paste", "keys.copy", "keys.back", "keys.close", "noAction"):
             self.assertTrue(any(option in warning for warning in config["warnings"]), option)
+
+    def test_config_leaves_qt_key_validation_to_overlay(self):
+        keys = {"up": ["Foo", "Up"], "back": ["Key_Escape"]}
+        self.write_config({"keys": keys})
+        config = self.snip("config")
+        self.assertEqual(config["keys"], {**DEFAULTS["keys"], **keys})
+        self.assertEqual(config["warnings"], [])
 
     def test_config_handles_unreadable_or_non_object_json(self):
         for data in (b"{", b"\xff", b"[1]", b'{"keys": null}'):
