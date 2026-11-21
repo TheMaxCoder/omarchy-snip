@@ -1060,7 +1060,7 @@ Item {
               text: root.categoryInputOpen
                 ? (root.categoryInputForSave ? "Create new tab and save" : "New tab")
                 : "Save to tab"
-              color: root.categoryInputOpen ? root.warning : root.foreground
+              color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.heading
               font.weight: Font.DemiBold
@@ -1101,9 +1101,8 @@ Item {
                   anchors.leftMargin: Style.spacing.controlPaddingX
                   anchors.verticalCenter: parent.verticalCenter
                   text: index === root.categories.length ? "＋  Create new tab…" : root.categories[index].name
-                  color: index === root.categories.length
-                    ? root.warning
-                    : (index === root.saveCategoryIndex ? root.selectedText : root.foreground)
+                  color: index === root.saveCategoryIndex ? root.selectedText
+                    : (index === root.categories.length ? root.accent : root.foreground)
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
                 }
