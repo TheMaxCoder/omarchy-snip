@@ -268,6 +268,18 @@ root = Path(os.environ['HOME'])
                 (self.bin / name).unlink()
         self.assertIn("No editor found", self.snip("edit", item_id, success=False))
 
+    def test_edit_does_not_overwrite_a_snippet_that_reused_the_id(self):
+        item_id = self.snip("pin-inbox", "--ref", self.ref())["id"]
+        self.env["EDITOR"] = str(self.executable("racing-editor", f'''
+"{SNIP}" delete {item_id} >/dev/null
+printf 'newer snippet' | "{SNIP}" add --stdin --title Newer >/dev/null
+printf '# Edited\\n\\nedited text\\n' > "$1"'''))
+        self.assertIn("changed or was deleted", self.snip("edit", item_id, success=False))
+        (item,) = self.snip("snapshot")["items"]
+        self.assertEqual((item["id"], item["body"]), (item_id, "newer snippet"))
+        (kept,) = self.runtime.iterdir()
+        self.assertIn("edited text", kept.read_text())
+
     def test_refs_survive_reordering_and_stale_refs_are_rejected(self):
         ref = self.ref()
         self.assertEqual(ref, hashlib.sha256(b"text\0clipboard value").hexdigest())

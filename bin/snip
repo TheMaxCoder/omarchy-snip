@@ -1063,7 +1063,7 @@ def main() -> int:
                 output({"ok": True, "name": category["name"], "moved": moved})
             elif args.command == "edit":
                 item = connection.execute(
-                    "SELECT kind, title, body FROM items WHERE id = ?", (args.item_id,)
+                    "SELECT kind, title, body, content_hash FROM items WHERE id = ?", (args.item_id,)
                 ).fetchone()
                 if item is None:
                     raise ValueError("snippet no longer exists")
@@ -1084,19 +1084,28 @@ def main() -> int:
                 try:
                     edit_file(editor, edit_path)
                     edited = edit_path.read_text(encoding="utf-8")
-                finally:
+                except BaseException:
                     edit_path.unlink(missing_ok=True)
+                    raise
                 first, separator, remainder = edited.partition("\n")
                 title = re.sub(r"^#\s+", "", first).strip()
                 body = remainder.lstrip("\n").rstrip() if separator else ""
+                kept = f"; your text is kept in {edit_path}"
                 if not title:
-                    raise ValueError("the first line must contain a snippet title")
-                with connection:
-                    connection.execute(
-                        "UPDATE items SET title = ?, body = ?, content_hash = ?, "
-                        "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (title, body, content_hash("text", body, ""), args.item_id),
-                    )
+                    raise ValueError("the first line must contain a snippet title" + kept)
+                # IDs can be reused after a delete, so save only over the snippet that was opened.
+                try:
+                    with connection:
+                        saved = connection.execute(
+                            "UPDATE items SET title = ?, body = ?, content_hash = ?, "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = ? AND content_hash = ?",
+                            (title, body, content_hash("text", body, ""), args.item_id, item["content_hash"]),
+                        ).rowcount
+                except sqlite3.IntegrityError:
+                    raise ValueError("another snippet already has this text" + kept) from None
+                if not saved:
+                    raise ValueError("the snippet changed or was deleted while you edited it" + kept)
+                edit_path.unlink(missing_ok=True)
                 output({"ok": True})
             elif args.command == "create-category":
                 name = args.name.strip()
@@ -1140,6 +1149,8 @@ def main() -> int:
         print(f"snip: {message}", file=sys.stderr)
         if args is not None and args.command == "paste" and not args.copy_only:
             notify("Snip could not paste", message)
+        elif args is not None and args.command == "edit":
+            notify("Snip could not save the edit", message)
         return 1
     return 0
 
