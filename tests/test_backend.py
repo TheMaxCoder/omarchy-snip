@@ -667,6 +667,16 @@ exit 1''')
         self.assertIn("Expected a Snip JSON export", self.snip("import", broken, success=False))
         self.assertEqual(self.snip("snapshot")["items"], items)
 
+    def test_numeric_new_tab_name_is_a_name_not_an_id(self):
+        first = self.snip("create-category", "Alpha")["id"]
+        self.write_history("numeric tab")
+        ref = self.snip("snapshot")["inbox"][0]["ref"]
+        created = self.snip("save-inbox-new", "--ref", ref, str(first))["categoryId"]
+        self.assertNotEqual(created, first)
+        snapshot = self.snip("snapshot")
+        self.assertEqual({c["id"]: c["name"] for c in snapshot["categories"]}[created], str(first))
+        self.assertEqual(snapshot["items"][0]["categoryId"], created)
+
     def test_subtitles_skip_the_title_and_describe_images(self):
         self.write_history("Heading\n\nSecond line", "one line only")
         inbox = self.snip("snapshot")["inbox"]

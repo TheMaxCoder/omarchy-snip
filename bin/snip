@@ -984,15 +984,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def category_id_for(connection: sqlite3.Connection, spec: str) -> int:
-    if spec.isdigit():
-        row = connection.execute("SELECT id FROM categories WHERE id = ?", (int(spec),)).fetchone()
-    else:
-        row = connection.execute(
-            "SELECT id FROM categories WHERE name = ? COLLATE NOCASE", (spec,)
-        ).fetchone()
+def existing_category_id(connection: sqlite3.Connection, category_id: int) -> int:
+    row = connection.execute("SELECT id FROM categories WHERE id = ?", (category_id,)).fetchone()
     if row is None:
-        raise ValueError(f"unknown category: {spec}")
+        raise ValueError(f"unknown category: {category_id}")
     return int(row[0])
 
 
@@ -1019,7 +1014,7 @@ def main() -> int:
                 with connection:
                     connection.execute("BEGIN IMMEDIATE")
                     pin = args.command == "pin-inbox"
-                    category_id = None if pin else category_id_for(connection, str(args.category_id))
+                    category_id = None if pin else existing_category_id(connection, args.category_id)
                     item_id = upsert_clipboard_item(connection, args.ref, category_id=category_id, pin=pin)
                 output({"ok": True, "id": item_id})
             elif args.command == "save-inbox-new":
@@ -1028,14 +1023,7 @@ def main() -> int:
                     raise ValueError("category name cannot be empty")
                 with connection:
                     connection.execute("BEGIN IMMEDIATE")
-                    order = connection.execute(
-                        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories"
-                    ).fetchone()[0]
-                    connection.execute(
-                        "INSERT OR IGNORE INTO categories(name, sort_order) VALUES (?, ?)",
-                        (name, order),
-                    )
-                    category_id = category_id_for(connection, name)
+                    category_id = category_for_name(connection, name)
                     item_id = upsert_clipboard_item(
                         connection, args.ref, category_id=category_id
                     )
