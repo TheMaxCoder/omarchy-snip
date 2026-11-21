@@ -6,6 +6,7 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 import "Keys.js" as KeyBindings
+import "Search.js" as Search
 
 Item {
   id: root
@@ -282,23 +283,11 @@ Item {
     }
   }
 
-  function matches(entry, query) {
-    var needle = query.toLowerCase()
-    return String(entry.title || "").toLowerCase().indexOf(needle) >= 0
-      || String(entry.body || "").toLowerCase().indexOf(needle) >= 0
-      || String(entry.categoryName || "").toLowerCase().indexOf(needle) >= 0
-  }
-
   function rebuildDisplay(preserveSelection) {
     var previous = preserveSelection ? root.selectedItem : null
     var rows = []
     if (root.searchMode) {
-      for (var s = 0; s < root.savedItems.length; s++) {
-        if (root.matches(root.savedItems[s], root.searchText)) rows.push(root.savedRow(root.savedItems[s]))
-      }
-      for (var x = 0; x < root.inboxItems.length; x++) {
-        if (root.matches(root.inboxItems[x], root.searchText)) rows.push(root.inboxRow(root.inboxItems[x]))
-      }
+      rows = Search.filter(root.searchText, root.savedItems.map(root.savedRow).concat(root.inboxItems.map(root.inboxRow)))
     } else if (root.currentTab === 0) {
       for (var i = 0; i < root.inboxItems.length; i++) rows.push(root.inboxRow(root.inboxItems[i]))
     } else if (root.currentTab === 1) {

@@ -46,13 +46,14 @@ class BackendTests(unittest.TestCase):
         }
         self.write_history("clipboard value")
 
-    def run_snip(self, *args):
+    def run_snip(self, *args, stdin=None):
         return subprocess.run(
-            [SNIP, *map(str, args)], cwd=self.root, env=self.env, capture_output=True, text=True
+            [SNIP, *map(str, args)], cwd=self.root, env=self.env, capture_output=True,
+            encoding="utf-8", input=stdin,
         )
 
-    def snip(self, *args, success=True):
-        result = self.run_snip(*args)
+    def snip(self, *args, success=True, stdin=None):
+        result = self.run_snip(*args, stdin=stdin)
         if not success:
             self.assertNotEqual(result.returncode, 0)
             return result.stderr
@@ -513,10 +514,140 @@ with patch.object(os, 'link', side_effect=OSError(int(error), os.strerror(int(er
         self.assertEqual(self.snip("edit", item_id, success=False).splitlines(),
                          ["snip: The editor could not finish editing the snippet"])
         self.assertEqual(list(self.runtime.iterdir()), [])
-        self.assertIn("wl-paste not found", self.snip("add", "Fail", success=False))
+        self.assertIn("wl-paste not found", self.snip("add", "--title", "Fail", success=False))
         self.executable("wl-paste", "printf 'line1\\nline2\\n' >&2; exit 17")
-        self.assertEqual(self.snip("add", "Fail", success=False).splitlines(),
+        self.assertEqual(self.snip("add", "--title", "Fail", success=False).splitlines(),
                          ["snip: Could not read text from the clipboard with wl-paste"])
+
+    def test_capture_clipboard_primary_and_stdin(self):
+        self.executable("wl-paste", '''printf '%s\\n' "$@" > "$HOME/wl-paste-args"
+case "$*" in *--primary*) printf 'selection text' ;; *) printf 'clipboard text' ;; esac''')
+        clipboard = self.snip("add")
+        self.assertEqual((clipboard["title"], clipboard["body"]), ("clipboard text", "clipboard text"))
+        self.assertIsNone(clipboard["categoryId"])
+        self.assertTrue(clipboard["pinned"])
+        self.assertEqual(self.snip("snapshot")["categories"], [])
+        self.assertEqual((self.root / "wl-paste-args").read_text().splitlines(),
+                         ["--type", "text", "--no-newline"])
+        primary = self.snip("add", "--primary", "--category", "Examples", "--title", "Selection")
+        self.assertEqual((primary["title"], primary["body"]), ("Selection", "selection text"))
+        self.assertIsNotNone(primary["categoryId"])
+        self.assertFalse(primary["pinned"])
+        self.assertIn("--primary", (self.root / "wl-paste-args").read_text().splitlines())
+        (self.bin / "wl-paste").unlink()
+        body = "\n# Démo\r\nline two\n\n"
+        stdin_item = self.snip("add", "--stdin", "--category", "examples", "--pin", stdin=body)
+        self.assertEqual(stdin_item["categoryId"], primary["categoryId"])
+        self.assertEqual((stdin_item["title"], stdin_item["body"]), ("Démo", body))
+        self.assertTrue(stdin_item["pinned"])
+        promoted = self.snip("add", "--stdin", stdin="selection text")
+        self.assertEqual(promoted["id"], primary["id"])
+        self.assertTrue(promoted["pinned"])
+        self.assertIsNone(promoted["categoryId"])
+        self.assertIn("No text to save", self.snip("add", "--stdin", stdin="\n ", success=False))
+        self.assertNotEqual(self.run_snip("add", "--stdin", "--primary", stdin="x").returncode, 0)
+
+    def test_capture_notification_is_opt_in_and_optional(self):
+        self.snip("add", "--stdin", "--notify", stdin="No notifier")
+        self.executable("notify-send", '''printf '%s\\n' "$@" > "$HOME/notification"
+exit 1''')
+        notice = self.root / "notification"
+        self.snip("add", "--stdin", stdin="Quiet")
+        self.assertFalse(notice.exists())
+        item = self.snip("add", "--stdin", "--notify", "--title", "Example", stdin="Private body")
+        self.assertEqual(item["title"], "Example")
+        self.assertEqual(notice.read_text().splitlines(), ["-a", "Snip", "Snip saved a snippet", "Example"])
+
+    def test_json_round_trip_preserves_text_and_references_images(self):
+        first = self.snip("add", "--stdin", "--category", "Examples", "--title", "Café", stdin="\nbody\r\n\n")
+        self.snip("used", first["id"])
+        self.snip("add", "--stdin", stdin="Uncategorized")
+        self.snip("add", "--stdin", stdin="Another pinned item")
+        self.snip("create-category", "Empty")
+        with closing(sqlite3.connect(Path(self.env["SNIP_DATA_DIR"]) / "snip.db")) as db, db:
+            db.execute("UPDATE items SET updated_at = '2026-01-01 00:00:00' WHERE pinned = 1")
+        source = self.write_image()
+        image = self.snip("save-inbox-new", "--ref", self.ref(), "Screenshots")
+        exported = self.snip("export", "--format", "json")
+        self.assertEqual((exported["format"], exported["version"]), ("snip", 1))
+        image_record = next(item for item in exported["items"] if item["id"] == image["id"])
+        self.assertTrue(Path(image_record["path"]).samefile(source))
+        self.assertEqual((image_record["mime"], image_record["body"]), ("image/png", ""))
+        skip = self.run_snip("export", "--skip-images")
+        self.assertEqual(skip.returncode, 0, skip.stderr)
+        self.assertIn("Skipped 1 image", skip.stderr)
+        self.assertEqual([item["kind"] for item in json.loads(skip.stdout)["items"]], ["text"] * 3)
+
+        output = self.root / "backup.json"
+        result = self.run_snip("export", "--output", output)
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertEqual(json.loads(output.read_text()), exported)
+        self.assertEqual(self.snip("import", output), {"imported": 0, "skipped": 4})
+        self.env["SNIP_DATA_DIR"] = str(self.root / "restored")
+        self.assertEqual(self.snip("import", output), {"imported": 4, "skipped": 0})
+        self.assertEqual(self.snip("import", output), {"imported": 0, "skipped": 4})
+        restored = self.snip("export")
+        self.assertEqual([item["contentHash"] for item in restored["items"]],
+                         [item["contentHash"] for item in exported["items"]])
+        self.assertEqual([tab["name"] for tab in restored["categories"]], ["Examples", "Empty", "Screenshots"])
+        from_backup = {item["contentHash"]: item for item in exported["items"]}
+        for item in restored["items"]:
+            expected = from_backup.pop(item["contentHash"]).copy()
+            for row in (item, expected):
+                row.pop("id")
+            if item["kind"] == "image":
+                self.assertTrue(Path(item.pop("path")).samefile(expected.pop("path")))
+            self.assertEqual(item, expected)
+        self.assertFalse(from_backup)
+
+    def test_markdown_round_trip_preserves_verbatim_bodies(self):
+        examples = ["Short text", "\n## Nested heading\n```\ntext in code\n```\n\n",
+                    "\nonly a leading newline and CRLF\r\n  ", "```unclosed\nplain text", "## Heading at start"]
+        for index, body in enumerate(examples):
+            self.snip("add", "--stdin", "--category", "Café notes", "--title", f"Example {index}", stdin=body)
+        self.snip("add", "--stdin", "--category", "Pinned", "--title", "Categorized", stdin="named Pinned")
+        title = "Separator & &#10;\r\nSecond line"
+        self.snip("add", "--stdin", "--category", "A/B%20", "--title", title, stdin="category path")
+        self.snip("add", "--stdin", "--title", "Uncategorized", stdin="pinned note")
+        self.snip("pin-inbox", "--ref", self.ref())
+        self.write_image()
+        self.snip("pin-inbox", "--ref", self.ref())
+        directory = self.root / "markdown"
+        self.assertIn("requires --output DIR", self.snip("export", "--format", "markdown", success=False))
+        result = self.run_snip("export", "--format", "markdown", "--output", directory)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual({file.name for file in directory.iterdir()},
+                         {"Café notes.md", "%50inned.md", "A%2FB%2520.md", "Pinned.md"})
+        md = (directory / "Café notes.md").read_bytes().decode("utf-8")
+        self.assertIn("## Example 0\nShort text\n\n", md)
+        self.assertIn("````snip\n" + examples[1] + "\n````", md)
+        self.assertNotIn("Screenshot", (directory / "Pinned.md").read_text())
+
+        self.env["SNIP_DATA_DIR"] = str(self.root / "restored")
+        self.assertEqual(self.snip("import", directory), {"imported": 9, "skipped": 0})
+        self.assertEqual(self.snip("import", directory), {"imported": 0, "skipped": 9})
+        saved = {item["title"]: item for item in self.snip("snapshot")["items"]}
+        for index, body in enumerate(examples):
+            item = saved[f"Example {index}"]
+            self.assertEqual(item["body"], body)
+            self.assertEqual(item["categoryName"], "Café notes")
+        self.assertEqual(saved["Categorized"]["categoryName"], "Pinned")
+        self.assertEqual(saved[title]["categoryName"], "A/B%20")
+        self.assertIsNone(saved["Uncategorized"]["categoryId"])
+        self.assertTrue(saved["Uncategorized"]["pinned"])
+
+    def test_import_single_markdown_and_reject_invalid_json(self):
+        source = self.root / "Shell.md"
+        source.write_text("## Script\n```sh\n## Not a new item\n```\n\n## Another\nhi\n")
+        self.assertEqual(self.snip("import", source), {"imported": 2, "skipped": 0})
+        items = self.snip("snapshot")["items"]
+        self.assertEqual({item["categoryName"] for item in items}, {"Shell"})
+        self.assertEqual({item["title"]: item["body"] for item in items},
+                         {"Script": "```sh\n## Not a new item\n```", "Another": "hi"})
+        broken = self.root / "invalid.json"
+        broken.write_text('{"format":"snip","version":2,"categories":[],"items":[]}')
+        self.assertIn("Expected a Snip JSON export", self.snip("import", broken, success=False))
+        self.assertEqual(self.snip("snapshot")["items"], items)
 
     def test_default_cli_uses_public_plugin_id(self):
         self.executable("omarchy-shell", r'''printf '"%s %s %s %s"\n' "$1" "$2" "$3" "$4"''')
