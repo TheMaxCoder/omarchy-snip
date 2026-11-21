@@ -86,8 +86,8 @@ EOF
 add Git "Undo last commit, keep changes" --pin <<'EOF'
 git reset --soft HEAD~1
 EOF
-add Git "Rebase onto main" <<'EOF'
-git fetch origin && git rebase --autostash origin/main
+add Git "Squash fixup commits" <<'EOF'
+git rebase --interactive --autosquash main
 EOF
 add Git "Delete merged branches" <<'EOF'
 git branch --merged main | grep -vE '^\*|\bmain$' | xargs -r git branch -d
@@ -113,8 +113,8 @@ EOF
 add Shell "Find files changed today" <<'EOF'
 find . -type f -newermt today -not -path './.git/*'
 EOF
-add Shell "Serve this folder" <<'EOF'
-python -m http.server 8000 --bind 127.0.0.1
+add Shell "Count tracked lines" <<'EOF'
+git ls-files -z | xargs -0 wc -l | tail -1
 EOF
 add Shell "Active window as JSON" <<'EOF'
 hyprctl activewindow -j | jq '{class, title, size}'
