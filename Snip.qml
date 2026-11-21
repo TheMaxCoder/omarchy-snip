@@ -1033,81 +1033,93 @@ Item {
       }
 
       Rectangle {
+        id: dialogScrim
         anchors.fill: parent
         z: 20
         visible: root.savePickerOpen || root.categoryInputOpen
         radius: root.cornerRadius
         color: Qt.rgba(root.background.r, root.background.g, root.background.b, 0.94)
 
-        Column {
+        BorderSurface {
           anchors.centerIn: parent
-          width: Math.min(parent.width * 0.5, Style.space(420))
-          spacing: Style.spacing.md
+          width: dialogColumn.width + contentLeftInset + contentRightInset
+          height: dialogColumn.implicitHeight + contentTopInset + contentBottomInset
+          radius: root.cornerRadius
+          color: root.background
+          borderSpec: root.borderSpec
+          padding: root.contentMargin
 
-          Text {
-            width: parent.width
-            text: root.categoryInputOpen
-              ? (root.categoryInputForSave ? "Create new tab and save" : "New tab")
-              : "Save to tab"
-            color: root.categoryInputOpen ? root.warning : root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.heading
-            font.weight: Font.DemiBold
-          }
-
-          Rectangle {
-            visible: root.categoryInputOpen
-            width: parent.width
-            height: root.headerHeight
-            radius: root.cornerRadius
-            color: root.selectedBackground
+          Column {
+            id: dialogColumn
+            anchors.centerIn: parent
+            width: Math.min(dialogScrim.width * 0.5, Style.space(420))
+            spacing: Style.spacing.md
 
             Text {
-              anchors.fill: parent
-              anchors.margins: Style.spacing.controlPaddingX
-              verticalAlignment: Text.AlignVCenter
-              text: root.categoryInput ? root.categoryInput + "▍" : "Category name…"
-              color: root.categoryInput ? root.foreground : root.selectedText
-              opacity: root.categoryInput ? 1 : 0.6
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.body
-            }
-          }
-
-          Repeater {
-            visible: root.savePickerOpen
-            model: root.categories.length + 1
-            delegate: Rectangle {
-              required property int index
-              visible: root.savePickerOpen
               width: parent.width
-              height: visible ? root.headerHeight : 0
+              text: root.categoryInputOpen
+                ? (root.categoryInputForSave ? "Create new tab and save" : "New tab")
+                : "Save to tab"
+              color: root.categoryInputOpen ? root.warning : root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.heading
+              font.weight: Font.DemiBold
+            }
+
+            Rectangle {
+              visible: root.categoryInputOpen
+              width: parent.width
+              height: root.headerHeight
               radius: root.cornerRadius
-              color: index === root.saveCategoryIndex ? root.selectedBackground : "transparent"
+              color: root.selectedBackground
 
               Text {
-                anchors.left: parent.left
-                anchors.leftMargin: Style.spacing.controlPaddingX
-                anchors.verticalCenter: parent.verticalCenter
-                text: index === root.categories.length ? "＋  Create new tab…" : root.categories[index].name
-                color: index === root.categories.length
-                  ? root.warning
-                  : (index === root.saveCategoryIndex ? root.selectedText : root.foreground)
+                anchors.fill: parent
+                anchors.margins: Style.spacing.controlPaddingX
+                verticalAlignment: Text.AlignVCenter
+                text: root.categoryInput ? root.categoryInput + "▍" : "Category name…"
+                color: root.categoryInput ? root.foreground : root.selectedText
+                opacity: root.categoryInput ? 1 : 0.6
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
               }
             }
-          }
 
-          Text {
-            width: parent.width
-            text: root.categoryInputOpen
-              ? root.hints(root.categoryInputKeys, [["confirm", "paste"], ["cancel", "back"]])
-              : root.hints(root.savePickerKeys, [["move", "up", "down"], ["confirm", "paste"], ["cancel", "back"]])
-            color: root.foreground
-            opacity: 0.5
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+            Repeater {
+              visible: root.savePickerOpen
+              model: root.categories.length + 1
+              delegate: Rectangle {
+                required property int index
+                visible: root.savePickerOpen
+                width: parent.width
+                height: visible ? root.headerHeight : 0
+                radius: root.cornerRadius
+                color: index === root.saveCategoryIndex ? root.selectedBackground : "transparent"
+
+                Text {
+                  anchors.left: parent.left
+                  anchors.leftMargin: Style.spacing.controlPaddingX
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: index === root.categories.length ? "＋  Create new tab…" : root.categories[index].name
+                  color: index === root.categories.length
+                    ? root.warning
+                    : (index === root.saveCategoryIndex ? root.selectedText : root.foreground)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                }
+              }
+            }
+
+            Text {
+              width: parent.width
+              text: root.categoryInputOpen
+                ? root.hints(root.categoryInputKeys, [["confirm", "paste"], ["cancel", "back"]])
+                : root.hints(root.savePickerKeys, [["move", "up", "down"], ["confirm", "paste"], ["cancel", "back"]])
+              color: root.foreground
+              opacity: 0.5
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
           }
         }
       }
