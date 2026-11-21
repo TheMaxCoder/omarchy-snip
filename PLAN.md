@@ -188,7 +188,8 @@ Node tests load the `.js` files with `vm` after stripping the `.pragma library` 
    - Update `last_used_at` for saved items. Snip no longer calls
      `omarchy-clipboard-paste-text`, which removes the ARG_MAX limit.
    - QML hides first, then `execDetached([backendPath, "paste", …])`. Copy-only
-     stays open and shows "Copied".
+     stays open and shows "Copied". Non-copy-only failures also notify through
+     `notify-send` when available.
    - Test: a 1 MB body round-trips through `paste --copy-only`, with
      `omarchy-clipboard-paste-file` stubbed by a fake executable (through
      `OMARCHY_PATH` or `PATH`) that records its arguments and the file contents.
@@ -224,7 +225,9 @@ Node tests load the `.js` files with `vm` after stripping the `.pragma library` 
      - clipboard history file exists and parses (warn: "enable omarchy.clipboard")
      - config parses, plus its warnings
      - DB opens, passes `PRAGMA integrity_check`, and is at the current schema version
-     - `hyprctl binds -j` contains `themaxcoder.snip` (warn with the README binding line if not, skip if hyprctl is absent)
+     - `themaxcoder.snip` appears as a token in a `.lua` or `.conf` file under
+       `${XDG_CONFIG_HOME:-~/.config}/hypr` (recursive, following symlinks;
+       `SNIP_HYPR_DIR` overrides it; warn with the README binding line if absent).
 6. **Concurrency.** Mutations already serialize in QML through `backend.running`.
    Also set `PRAGMA busy_timeout` and use WAL mode, so a detached `paste`/`used`
    racing a `snapshot` never fails.

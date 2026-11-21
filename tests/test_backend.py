@@ -36,6 +36,7 @@ class BackendTests(unittest.TestCase):
             "SNIP_DATA_DIR": str(self.root / "data"),
             "SNIP_CLIPBOARD_FILE": str(self.history),
             "SNIP_CONFIG_FILE": str(self.config),
+            "SNIP_HYPR_DIR": str(self.root / "hypr"),
             "XDG_CONFIG_HOME": str(self.root / "xdg-config"),
             "XDG_STATE_HOME": str(self.root / "xdg-state"),
             "XDG_RUNTIME_DIR": str(self.runtime),
@@ -323,6 +324,23 @@ root = Path(os.environ['HOME'])
         for selectors in ((), ("--ref", ref, "--id", 1)):
             self.assertNotEqual(self.run_snip("paste", *selectors).returncode, 0)
 
+    def test_only_non_copy_paste_failures_notify(self):
+        notice = self.root / "notification"
+        self.executable("notify-send", '''printf '%s\\n' "$@" > "$HOME/notification"
+printf 'ignore this error\\n' >&2
+exit 1''')
+        message = "That clipboard item is no longer in history"
+        self.assertEqual(self.snip("paste", "--ref", "stale", "--copy-only", success=False).strip(),
+                         f"snip: {message}")
+        self.assertFalse(notice.exists())
+        self.assertEqual(self.snip("paste", "--ref", "stale", success=False).splitlines(),
+                         [f"snip: {message}"])
+        self.assertEqual(notice.read_text().splitlines(), ["-a", "Snip", "Snip could not paste", message])
+        notice.unlink()
+        self.paste_stub()
+        self.snip("paste", "--ref", self.ref())
+        self.assertFalse(notice.exists())
+
     def test_image_is_linked_and_pastes_after_source_is_deleted(self):
         self.paste_stub()
         source = self.write_image()
@@ -431,7 +449,14 @@ with patch.object(os, 'link', side_effect=OSError(int(error), os.strerror(int(er
         self.paste_stub(bundled=True)
         self.executable("wl-paste", "exit 0")
         self.executable("xdg-terminal-exec", "exit 0")
-        self.executable("hyprctl", r'''test "$*" = 'binds -j' && printf '%s' '[{"arg":"omarchy-shell shell toggle themaxcoder.snip {}"}]' ''')
+        hypr = Path(self.env["SNIP_HYPR_DIR"])
+        hypr.mkdir()
+        extras = self.root / "extras"
+        extras.mkdir()
+        (hypr / "linked").symlink_to(extras, target_is_directory=True)
+        (extras / "cycle").symlink_to(hypr, target_is_directory=True)
+        binding = extras / "bindings.lua"
+        binding.write_text('o.rebind("SUPER + CTRL + V", "Snip", { panel = "themaxcoder.snip" })')
         result = self.run_snip("doctor")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for label in ("Python", "omarchy-clipboard-paste-file", "wl-copy", "wl-paste", "wtype",
@@ -441,14 +466,27 @@ with patch.object(os, 'link', side_effect=OSError(int(error), os.strerror(int(er
         self.history.write_text("not JSON")
         self.write_config({"unknown": True})
         (self.bin / "xdg-terminal-exec").unlink()
-        self.executable("hyprctl", r'''printf '%s' '[{"arg":"themaxcoder.snip.old"}]' ''')
+        binding.write_text('local panel = "themaxcoder.snip.old"')
+        (hypr / "ignored.txt").write_text("themaxcoder.snip")
+        (hypr / "broken.conf").symlink_to(self.root / "missing.conf")
         result = self.run_snip("doctor")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for message in ("✗ xdg-terminal-exec", "Enable omarchy.clipboard", "✗ Config warning",
                         'o.rebind("SUPER + CTRL + V", "Snip", { panel = "themaxcoder.snip" })'):
             self.assertIn(message, result.stdout)
-        (self.bin / "hyprctl").unlink()
-        self.assertNotIn("Hyprland binding", self.run_snip("doctor").stdout)
+        self.assertIn("✗ Hyprland binding", result.stdout)
+
+        self.env.pop("SNIP_HYPR_DIR")
+        default_hypr = Path(self.env["XDG_CONFIG_HOME"]) / "hypr"
+        default_hypr.mkdir(parents=True)
+        conf = extras / "defaults.conf"
+        conf.write_text("bind = SUPER CTRL, V, exec, omarchy-shell shell toggle themaxcoder.snip {}")
+        (default_hypr / "bindings.conf").symlink_to(conf)
+        self.assertIn("✓ Hyprland binding", self.run_snip("doctor").stdout)
+        self.env["XDG_CONFIG_HOME"] = ""
+        (self.root / ".config").mkdir()
+        (self.root / ".config/hypr").symlink_to(default_hypr, target_is_directory=True)
+        self.assertIn("✓ Hyprland binding", self.run_snip("doctor").stdout)
 
     def test_doctor_fails_without_requirements_or_on_broken_config_and_db(self):
         self.config.write_text("{")
