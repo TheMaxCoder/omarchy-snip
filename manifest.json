@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "nox.snip",
+  "name": "Snip",
+  "version": "1.0.0",
+  "author": "nox",
+  "description": "Navigation-first snippet and clipboard picker",
+  "kinds": [
+    "overlay"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Snip.qml"
+  }
+}

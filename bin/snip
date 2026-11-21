@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""Snip's SQLite-backed command-line data service."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+
+DATA_DIR = Path(
+    os.environ.get(
+        "SNIP_DATA_DIR",
+        Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "snip",
+    )
+)
+DATABASE = DATA_DIR / "snip.db"
+CLIPBOARD_HISTORY = Path(
+    os.environ.get(
+        "SNIP_CLIPBOARD_FILE",
+        Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+        / "omarchy/clipboard-history.json",
+    )
+)
+LEGACY_DIR = Path(os.environ.get("SNIP_LEGACY_DIR", Path.home() / ".config/snip"))
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    sort_order INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS items (
+    id INTEGER PRIMARY KEY,
+    category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('text', 'image')),
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    mime TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL UNIQUE,
+    pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS items_category_id ON items(category_id);
+CREATE INDEX IF NOT EXISTS items_pinned ON items(pinned);
+
+CREATE TABLE IF NOT EXISTS metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+
+def connect() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DATABASE, timeout=5)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA busy_timeout = 5000")
+    connection.executescript(SCHEMA)
+    return connection
+
+
+def output(value: object) -> None:
+    json.dump(value, sys.stdout, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write("\n")
+
+
+def content_hash(kind: str, body: str, path: str) -> str:
+    payload = f"{kind}\0{path if kind == 'image' else body}".encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def display_title(text: str, fallback: str = "Untitled") -> str:
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    first_line = re.sub(r"^#{1,6}\s+", "", first_line)
+    first_line = re.sub(r"^(\*\*|__)(.+)\1$", r"\2", first_line)
+    return first_line[:80] or fallback
+
+
+def parse_legacy_content(content: str) -> list[tuple[str, str]]:
+    sections = re.split(r"(?m)^#\s+", content)
+    items: list[tuple[str, str]] = []
+    for section in sections:
+        if not section.strip():
+            continue
+        title, separator, body = section.strip().partition("\n")
+        items.append((title.strip(), body.strip() if separator else ""))
+    return items
+
+
+def legacy_documents() -> list[tuple[Path, str]]:
+    if LEGACY_DIR.is_dir():
+        files = sorted(path for path in LEGACY_DIR.glob("*.md") if path.is_file())
+        if files:
+            return [(path, path.read_text(encoding="utf-8")) for path in files]
+
+    repository = Path.home() / ".dotfiles"
+    documents: list[tuple[Path, str]] = []
+    for name in ("1_prompts.md", "2_snippets.md", "3_emails.md", "4_commands.md"):
+        result = subprocess.run(
+            ["git", "-C", str(repository), "show", f"HEAD:home/.config/snip/{name}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            documents.append((Path(name), result.stdout))
+    return documents
+
+
+def category_name(path: Path) -> str:
+    stem = re.sub(r"^\d+[_-]?", "", path.stem)
+    return stem.replace("_", " ").replace("-", " ").strip().title() or path.stem.title()
+
+
+def migrate_legacy(connection: sqlite3.Connection) -> int:
+    migrated = connection.execute(
+        "SELECT value FROM metadata WHERE key = 'legacy_migrated'"
+    ).fetchone()
+    if migrated is not None:
+        return 0
+
+    count = 0
+    documents = legacy_documents()
+    with connection:
+        for order, (path, content) in enumerate(documents, start=1):
+            name = category_name(path)
+            cursor = connection.execute(
+                "INSERT INTO categories(name, sort_order) VALUES (?, ?) "
+                "ON CONFLICT(name) DO UPDATE SET sort_order = excluded.sort_order "
+                "RETURNING id",
+                (name, order),
+            )
+            category_id = cursor.fetchone()[0]
+            for title, body in parse_legacy_content(content):
+                result = connection.execute(
+                    "INSERT OR IGNORE INTO items "
+                    "(category_id, kind, title, body, content_hash) VALUES (?, 'text', ?, ?, ?)",
+                    (category_id, title, body, content_hash("text", body, "")),
+                )
+                count += result.rowcount
+
+        if not documents:
+            for order, name in enumerate(("Prompts", "Snippets", "Emails", "Commands"), start=1):
+                connection.execute(
+                    "INSERT OR IGNORE INTO categories(name, sort_order) VALUES (?, ?)",
+                    (name, order),
+                )
+
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES ('legacy_migrated', CURRENT_TIMESTAMP)"
+        )
+    return count
+
+
+def load_clipboard() -> list[dict[str, object]]:
+    try:
+        data = json.loads(CLIPBOARD_HISTORY.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+    entries: list[dict[str, object]] = []
+    if not isinstance(data, list):
+        return entries
+    for index, entry in enumerate(data):
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("type", "text")
+        if kind == "image":
+            path = str(entry.get("path", ""))
+            if not path:
+                continue
+            entries.append(
+                {
+                    "historyIndex": index,
+                    "kind": "image",
+                    "title": f"Screenshot · {entry.get('capturedAt', 'image')}",
+                    "body": "",
+                    "path": path,
+                    "mime": str(entry.get("mime", "image/png")),
+                    "subtitle": Path(path).name,
+                }
+            )
+            continue
+
+        text = entry.get("text", "")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        subtitle = lines[1][:100] if len(lines) > 1 else f"{len(text.splitlines())} lines · {len(text)} chars"
+        entries.append(
+            {
+                "historyIndex": index,
+                "kind": "text",
+                "title": display_title(text),
+                "body": text,
+                "path": "",
+                "mime": "text/plain",
+                "subtitle": subtitle,
+            }
+        )
+    return entries
+
+
+def clipboard_entry(history_index: int) -> dict[str, object]:
+    for entry in load_clipboard():
+        if entry["historyIndex"] == history_index:
+            return entry
+    raise ValueError("clipboard entry is no longer available")
+
+
+def upsert_clipboard_item(
+    connection: sqlite3.Connection,
+    history_index: int,
+    *,
+    category_id: int | None = None,
+    pin: bool = False,
+) -> int:
+    entry = clipboard_entry(history_index)
+    kind = str(entry["kind"])
+    body = str(entry["body"])
+    path = str(entry["path"])
+    digest = content_hash(kind, body, path)
+    with connection:
+        connection.execute(
+            "INSERT INTO items "
+            "(category_id, kind, title, body, path, mime, content_hash, pinned) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(content_hash) DO UPDATE SET "
+            "category_id = COALESCE(excluded.category_id, items.category_id), "
+            "pinned = MAX(items.pinned, excluded.pinned), "
+            "updated_at = CURRENT_TIMESTAMP",
+            (
+                category_id,
+                kind,
+                entry["title"],
+                body,
+                path,
+                entry["mime"],
+                digest,
+                int(pin),
+            ),
+        )
+        row = connection.execute(
+            "SELECT id FROM items WHERE content_hash = ?", (digest,)
+        ).fetchone()
+    return int(row[0])
+
+
+def snapshot(connection: sqlite3.Connection) -> dict[str, object]:
+    categories = [
+        dict(row)
+        for row in connection.execute(
+            "SELECT id, name, sort_order AS sortOrder FROM categories ORDER BY sort_order, name"
+        )
+    ]
+    items = [
+        dict(row)
+        for row in connection.execute(
+            "SELECT items.id, items.category_id AS categoryId, "
+            "COALESCE(categories.name, '') AS categoryName, items.kind, items.title, "
+            "items.body, items.path, items.mime, items.pinned, "
+            "items.created_at AS createdAt, items.updated_at AS updatedAt "
+            "FROM items LEFT JOIN categories ON categories.id = items.category_id "
+            "ORDER BY items.pinned DESC, COALESCE(items.last_used_at, items.updated_at) DESC, items.id DESC"
+        )
+    ]
+    for item in items:
+        item["pinned"] = bool(item["pinned"])
+        body = item["body"]
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        item["subtitle"] = lines[0][:100] if lines else item["categoryName"]
+    return {"categories": categories, "items": items, "inbox": load_clipboard()}
+
+
+def current_clipboard_text() -> str:
+    result = subprocess.run(
+        ["wl-paste", "--type", "text", "--no-newline"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if not result.stdout.strip():
+        raise ValueError("clipboard is empty or does not contain text")
+    return result.stdout
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manage the Snip library")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("snapshot")
+    subparsers.add_parser("migrate")
+
+    pin = subparsers.add_parser("pin-inbox")
+    pin.add_argument("history_index", type=int)
+
+    save = subparsers.add_parser("save-inbox")
+    save.add_argument("history_index", type=int)
+    save.add_argument("category_id", type=int)
+
+    save_new = subparsers.add_parser("save-inbox-new")
+    save_new.add_argument("history_index", type=int)
+    save_new.add_argument("name")
+
+    toggle = subparsers.add_parser("toggle-pin")
+    toggle.add_argument("item_id", type=int)
+
+    delete = subparsers.add_parser("delete")
+    delete.add_argument("item_id", type=int)
+
+    delete_category = subparsers.add_parser("delete-category")
+    delete_category.add_argument("category_id", type=int)
+
+    edit = subparsers.add_parser("edit")
+    edit.add_argument("item_id", type=int)
+
+    category = subparsers.add_parser("create-category")
+    category.add_argument("name")
+
+    add = subparsers.add_parser("add")
+    add.add_argument("title")
+    add.add_argument("category", nargs="?", default="Prompts")
+
+    used = subparsers.add_parser("used")
+    used.add_argument("item_id", type=int)
+    return parser
+
+
+def category_id_for(connection: sqlite3.Connection, spec: str) -> int:
+    if spec.isdigit():
+        row = connection.execute("SELECT id FROM categories WHERE id = ?", (int(spec),)).fetchone()
+    else:
+        row = connection.execute(
+            "SELECT id FROM categories WHERE name = ? COLLATE NOCASE", (spec,)
+        ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown category: {spec}")
+    return int(row[0])
+
+
+def main() -> int:
+    if len(sys.argv) == 1:
+        try:
+            return subprocess.run(
+                ["omarchy-shell", "shell", "toggle", "nox.snip", "{}"],
+                check=False,
+            ).returncode
+        except OSError as error:
+            print(f"snip: {error}", file=sys.stderr)
+            return 1
+
+    args = build_parser().parse_args()
+    try:
+        with connect() as connection:
+            migrate_legacy(connection)
+            if args.command == "snapshot":
+                output(snapshot(connection))
+            elif args.command == "migrate":
+                output({"ok": True, "database": str(DATABASE)})
+            elif args.command == "pin-inbox":
+                output(
+                    {
+                        "ok": True,
+                        "id": upsert_clipboard_item(
+                            connection, args.history_index, pin=True
+                        ),
+                    }
+                )
+            elif args.command == "save-inbox":
+                category_id_for(connection, str(args.category_id))
+                output(
+                    {
+                        "ok": True,
+                        "id": upsert_clipboard_item(
+                            connection,
+                            args.history_index,
+                            category_id=args.category_id,
+                        ),
+                    }
+                )
+            elif args.command == "save-inbox-new":
+                name = args.name.strip()
+                if not name:
+                    raise ValueError("category name cannot be empty")
+                with connection:
+                    order = connection.execute(
+                        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories"
+                    ).fetchone()[0]
+                    connection.execute(
+                        "INSERT OR IGNORE INTO categories(name, sort_order) VALUES (?, ?)",
+                        (name, order),
+                    )
+                    category_id = category_id_for(connection, name)
+                    item_id = upsert_clipboard_item(
+                        connection, args.history_index, category_id=category_id
+                    )
+                output({"ok": True, "id": item_id, "categoryId": category_id})
+            elif args.command == "toggle-pin":
+                with connection:
+                    item = connection.execute(
+                        "SELECT category_id, pinned FROM items WHERE id = ?",
+                        (args.item_id,),
+                    ).fetchone()
+                    if item is None:
+                        raise ValueError("snippet no longer exists")
+                    if item["category_id"] is None and item["pinned"]:
+                        cursor = connection.execute(
+                            "DELETE FROM items WHERE id = ?", (args.item_id,)
+                        )
+                    else:
+                        cursor = connection.execute(
+                            "UPDATE items SET pinned = NOT pinned, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (args.item_id,),
+                        )
+                if cursor.rowcount != 1:
+                    raise ValueError("snippet no longer exists")
+                output({"ok": True})
+            elif args.command == "delete":
+                with connection:
+                    cursor = connection.execute(
+                        "DELETE FROM items WHERE id = ?", (args.item_id,)
+                    )
+                if cursor.rowcount != 1:
+                    raise ValueError("snippet no longer exists")
+                output({"ok": True})
+            elif args.command == "delete-category":
+                category = connection.execute(
+                    "SELECT name FROM categories WHERE id = ?", (args.category_id,)
+                ).fetchone()
+                if category is None:
+                    raise ValueError("category no longer exists")
+                with connection:
+                    moved = connection.execute(
+                        "UPDATE items SET pinned = 1, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE category_id = ?",
+                        (args.category_id,),
+                    ).rowcount
+                    connection.execute(
+                        "DELETE FROM categories WHERE id = ?", (args.category_id,)
+                    )
+                output({"ok": True, "name": category["name"], "moved": moved})
+            elif args.command == "edit":
+                item = connection.execute(
+                    "SELECT kind, title, body FROM items WHERE id = ?", (args.item_id,)
+                ).fetchone()
+                if item is None:
+                    raise ValueError("snippet no longer exists")
+                if item["kind"] != "text":
+                    raise ValueError("image entries cannot be edited as text")
+                runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()))
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    prefix="snip-edit-",
+                    suffix=".md",
+                    dir=runtime_dir,
+                    delete=False,
+                ) as temporary:
+                    temporary.write(f"# {item['title']}\n\n{item['body']}\n")
+                    edit_path = Path(temporary.name)
+                try:
+                    editor = shlex.split(os.environ.get("EDITOR", "nvim"))
+                    if not editor:
+                        editor = ["nvim"]
+                    result = subprocess.run([*editor, str(edit_path)], check=False)
+                    if result.returncode != 0:
+                        raise ValueError("editor exited without saving")
+                    edited = edit_path.read_text(encoding="utf-8")
+                finally:
+                    edit_path.unlink(missing_ok=True)
+                first, separator, remainder = edited.partition("\n")
+                title = re.sub(r"^#\s+", "", first).strip()
+                body = remainder.lstrip("\n").rstrip() if separator else ""
+                if not title:
+                    raise ValueError("the first line must contain a snippet title")
+                with connection:
+                    connection.execute(
+                        "UPDATE items SET title = ?, body = ?, content_hash = ?, "
+                        "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (title, body, content_hash("text", body, ""), args.item_id),
+                    )
+                output({"ok": True})
+            elif args.command == "create-category":
+                name = args.name.strip()
+                if not name:
+                    raise ValueError("category name cannot be empty")
+                with connection:
+                    order = connection.execute(
+                        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories"
+                    ).fetchone()[0]
+                    cursor = connection.execute(
+                        "INSERT INTO categories(name, sort_order) VALUES (?, ?)",
+                        (name, order),
+                    )
+                output({"ok": True, "id": cursor.lastrowid})
+            elif args.command == "add":
+                body = current_clipboard_text()
+                category_id = category_id_for(connection, args.category)
+                digest = content_hash("text", body, "")
+                with connection:
+                    connection.execute(
+                        "INSERT INTO items(category_id, kind, title, body, mime, content_hash) "
+                        "VALUES (?, 'text', ?, ?, 'text/plain', ?) "
+                        "ON CONFLICT(content_hash) DO UPDATE SET "
+                        "category_id = excluded.category_id, title = excluded.title, updated_at = CURRENT_TIMESTAMP",
+                        (
+                            category_id,
+                            args.title.strip() or display_title(body),
+                            body,
+                            digest,
+                        ),
+                    )
+                output({"ok": True})
+            elif args.command == "used":
+                with connection:
+                    connection.execute(
+                        "UPDATE items SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (args.item_id,),
+                    )
+                output({"ok": True})
+    except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as error:
+        print(f"snip: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
