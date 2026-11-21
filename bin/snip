@@ -173,6 +173,34 @@ def display_title(text: str, fallback: str = "Untitled") -> str:
     return first_line[:80] or fallback
 
 
+def text_subtitle(title: str, text: str) -> str:
+    """Return the line after the title, or a size summary when there is none."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    shown = title.strip().rstrip("…").strip()
+    repeats = bool(lines and shown) and (display_title(text).startswith(shown) or lines[0].startswith(shown))
+    rest = lines[1:] if repeats else lines
+    if rest:
+        return rest[0][:100]
+    count = len(text.splitlines())
+    return f"{count} line{'' if count == 1 else 's'} · {len(text)} chars"
+
+
+def image_subtitle(path: str, mime: str) -> str:
+    """Describe an image by format, pixel size (PNG), and file size."""
+    parts = [(mime.rpartition("/")[2] or "image").upper()]
+    try:
+        with open(path, "rb") as image:
+            header = image.read(24)
+            size = os.fstat(image.fileno()).st_size
+    except OSError:
+        return parts[0] + " · file missing"
+    if header[:8] == b"\x89PNG\r\n\x1a\n" and header[12:16] == b"IHDR":
+        width, height = int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+        parts.append(f"{width}×{height}")
+    parts.append(f"{size / 1024:.0f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB")
+    return " · ".join(parts)
+
+
 def key_binding(spec: object) -> tuple[frozenset[str], str] | None:
     """Check spec structure and normalize bindings; Qt validates the key itself."""
     if not isinstance(spec, str) or not spec:
@@ -311,7 +339,7 @@ def load_clipboard() -> list[dict[str, object]]:
                     "body": "",
                     "path": path,
                     "mime": str(entry.get("mime", "image/png")),
-                    "subtitle": Path(path).name,
+                    "subtitle": image_subtitle(path, str(entry.get("mime", "image/png"))),
                 }
             )
             continue
@@ -323,8 +351,7 @@ def load_clipboard() -> list[dict[str, object]]:
             ref = content_hash("text", text, "")
         except UnicodeEncodeError:
             continue
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        subtitle = lines[1][:100] if len(lines) > 1 else f"{len(text.splitlines())} lines · {len(text)} chars"
+        subtitle = text_subtitle(display_title(text), text)
         entries.append(
             {
                 "ref": ref,
@@ -457,9 +484,10 @@ def snapshot(connection: sqlite3.Connection) -> dict[str, object]:
         item["categoryName"] = names.get(item["categoryId"], "")
         if item["kind"] == "image":
             item["imageMissing"] = image_missing(item["path"])
-        body = item["body"]
-        lines = [line.strip() for line in body.splitlines() if line.strip()]
-        item["subtitle"] = lines[0][:100] if lines else item["categoryName"]
+        if item["kind"] == "image":
+            item["subtitle"] = image_subtitle(item["path"], item["mime"])
+        else:
+            item["subtitle"] = text_subtitle(item["title"], item["body"])
     return {
         "categories": categories,
         "items": items,

@@ -667,6 +667,19 @@ exit 1''')
         self.assertIn("Expected a Snip JSON export", self.snip("import", broken, success=False))
         self.assertEqual(self.snip("snapshot")["items"], items)
 
+    def test_subtitles_skip_the_title_and_describe_images(self):
+        self.write_history("Heading\n\nSecond line", "one line only")
+        inbox = self.snip("snapshot")["inbox"]
+        self.assertEqual([entry["subtitle"] for entry in inbox], ["Second line", "1 line · 13 chars"])
+        self.snip("pin-inbox", "--ref", inbox[0]["ref"])
+        self.assertEqual(self.snip("snapshot")["items"][0]["subtitle"], "Second line")
+        source = self.root / "pixel.png"
+        source.write_bytes(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR" + (3).to_bytes(4, "big") + (2).to_bytes(4, "big"))
+        self.history.write_text(json.dumps([{"type": "image", "path": str(source), "mime": "image/png"}]))
+        self.assertEqual(self.snip("snapshot")["inbox"][0]["subtitle"], "PNG · 3×2 · 0 KB")
+        source.unlink()
+        self.assertEqual(self.snip("snapshot")["inbox"][0]["subtitle"], "PNG · file missing")
+
     def test_top_level_help_lists_only_public_commands(self):
         result = self.run_snip("--help")
         self.assertEqual(result.returncode, 0, result.stderr)
