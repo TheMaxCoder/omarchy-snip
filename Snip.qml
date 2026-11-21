@@ -10,7 +10,6 @@ import "Keys.js" as KeyBindings
 Item {
   id: root
 
-  property string omarchyPath: Quickshell.env("OMARCHY_PATH")
   property string homePath: Quickshell.env("HOME")
   property var shell: null
   property var manifest: null
@@ -254,7 +253,7 @@ Item {
     return {
       source: "inbox",
       itemId: -1,
-      historyIndex: Number(entry.historyIndex),
+      ref: entry.ref,
       categoryId: -1,
       categoryName: "Inbox",
       kind: entry.kind || "text",
@@ -262,7 +261,7 @@ Item {
       subtitle: entry.subtitle || "",
       body: entry.body || "",
       path: entry.path || "",
-      mime: entry.mime || "text/plain",
+      imageMissing: Boolean(entry.imageMissing),
       pinned: false
     }
   }
@@ -271,7 +270,6 @@ Item {
     return {
       source: "saved",
       itemId: Number(entry.id),
-      historyIndex: -1,
       categoryId: entry.categoryId === null ? -1 : Number(entry.categoryId),
       categoryName: entry.categoryName || "Pinned only",
       kind: entry.kind || "text",
@@ -279,7 +277,7 @@ Item {
       subtitle: entry.subtitle || entry.categoryName || "",
       body: entry.body || "",
       path: entry.path || "",
-      mime: entry.mime || "text/plain",
+      imageMissing: Boolean(entry.imageMissing),
       pinned: Boolean(entry.pinned)
     }
   }
@@ -322,8 +320,7 @@ Item {
         var row = rows[r]
         if (row.source === previous.source && (row.source === "saved"
             ? row.itemId === previous.itemId
-            : row.kind === previous.kind && row.body === previous.body
-              && row.path === previous.path && row.mime === previous.mime)) {
+            : row.ref === previous.ref)) {
           nextIndex = r
           break
         }
@@ -390,31 +387,20 @@ Item {
   function pasteSelected(copyOnly) {
     var row = root.selectedItem
     if (!row || !root.checkBackendPath()) return
-    var command
-    if (row.kind === "image") {
-      command = [root.omarchyPath + "/bin/omarchy-clipboard-paste-file"]
-      if (copyOnly) command.push("--copy-only")
-      command.push(row.mime, row.path)
+    var args = row.source === "inbox" ? ["paste", "--ref", row.ref] : ["paste", "--id", String(row.itemId)]
+    if (copyOnly) {
+      root.runBackend(args.concat(["--copy-only"]), "copy")
     } else {
-      command = [root.omarchyPath + "/bin/omarchy-clipboard-paste-text"]
-      if (copyOnly) command.push("--copy-only")
-      else command.push("--shift-insert")
-      if (row.source === "inbox") command.push("--history-index", String(row.historyIndex))
-      else command.push(row.body)
+      root.dismiss()
+      Quickshell.execDetached([root.backendPath].concat(args))
     }
-
-    if (row.source === "saved")
-      Quickshell.execDetached([root.backendPath, "used", String(row.itemId)])
-    if (!copyOnly) root.dismiss()
-    else root.status("Copied", "success")
-    Quickshell.execDetached(command)
   }
 
   function quickPin() {
     var row = root.selectedItem
     if (!row) return
     if (row.source === "inbox") {
-      if (root.runBackend(["pin-inbox", String(row.historyIndex)], "mutate")) {
+      if (root.runBackend(["pin-inbox", "--ref", row.ref], "mutate")) {
         var save = root.keyHint(root.keymap, ["save"])
         root.status("Pinned" + (save ? " · " + save + " choose or create a tab" : ""), "success")
       }
@@ -443,7 +429,7 @@ Item {
     var category = root.categories[root.saveCategoryIndex]
     if (!row || !category) return
     root.savePickerOpen = false
-    if (root.runBackend(["save-inbox", String(row.historyIndex), String(category.id)], "mutate"))
+    if (root.runBackend(["save-inbox", "--ref", row.ref, String(category.id)], "mutate"))
       root.status("Saved to " + category.name, "success")
   }
 
@@ -514,7 +500,7 @@ Item {
     root.categoryInputForSave = false
     root.categoryInput = ""
     if (saveAfterCreate && row && row.source === "inbox") {
-      if (root.runBackend(["save-inbox-new", String(row.historyIndex), name], "mutate"))
+      if (root.runBackend(["save-inbox-new", "--ref", row.ref, "--", name], "mutate"))
         root.status("Created and saved to " + name, "success")
     } else if (root.runBackend(["create-category", name], "mutate")) {
       root.status("Created " + name, "success")
@@ -540,7 +526,10 @@ Item {
         return
       }
       if (action === "snapshot") root.applySnapshot(root.processOutput)
-      else refreshTimer.restart()
+      else {
+        if (action === "copy") root.status("Copied", "success")
+        refreshTimer.restart()
+      }
     }
   }
 
@@ -973,10 +962,12 @@ Item {
                 spacing: Style.spacing.lg
 
                 Image {
+                  id: previewImage
                   width: parent.width
                   height: visible ? Math.min(Style.space(430), implicitHeight * width / Math.max(1, implicitWidth)) : 0
-                  visible: root.selectedItem !== null && root.selectedItem.kind === "image"
-                  source: visible ? Util.fileUrl(root.selectedItem.path) : ""
+                  visible: source.toString() !== "" && status !== Image.Error
+                  source: root.selectedItem && root.selectedItem.kind === "image" && !root.selectedItem.imageMissing
+                    ? Util.fileUrl(root.selectedItem.path) : ""
                   fillMode: Image.PreserveAspectFit
                   asynchronous: true
                   cache: false
@@ -984,8 +975,10 @@ Item {
 
                 Text {
                   width: parent.width
-                  visible: root.selectedItem !== null && root.selectedItem.kind !== "image"
-                  text: root.previewText
+                  visible: root.selectedItem !== null
+                    && (root.selectedItem.kind !== "image" || root.selectedItem.imageMissing || previewImage.status === Image.Error)
+                  text: !root.selectedItem || root.selectedItem.kind !== "image" ? root.previewText
+                    : (root.selectedItem.imageMissing ? "Image file missing" : "Could not load image")
                   textFormat: Text.PlainText
                   color: root.foreground
                   font.family: root.fontFamily

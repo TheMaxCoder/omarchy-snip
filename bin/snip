@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing, nullcontext
+import errno
 import hashlib
 import json
 import os
@@ -15,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 
 
 DATA_DIR = Path(
@@ -36,6 +39,10 @@ CONFIG_FILE = Path(
 ).absolute()
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.example.json"
 KEY_MODIFIERS = {"Ctrl", "Alt", "Shift", "Super"}
+PLUGIN_ID = "themaxcoder.snip"
+PASTE_TOOL = "omarchy-clipboard-paste-file"
+TEXT_MIME = "text/plain;charset=utf-8"
+IMAGE_MISSING = "Image file missing"
 
 
 SCHEMA = """
@@ -71,13 +78,72 @@ CREATE TABLE IF NOT EXISTS metadata (
 """
 
 
+def create_baseline_schema(connection: sqlite3.Connection) -> None:
+    # executescript() would commit the surrounding migration transaction.
+    for statement in SCHEMA.strip().rstrip(";").split(";"):
+        connection.execute(statement)
+
+
+def migrate_saved_images(connection: sqlite3.Connection) -> None:
+    data_dir = DATA_DIR.resolve()
+    rows = connection.execute("SELECT id, path, content_hash FROM items WHERE kind = 'image'")
+    for row in rows.fetchall():
+        path = Path(row["path"])
+        if not path.resolve().is_relative_to(data_dir) and path.is_file():
+            owned = store_image(path, row["content_hash"])
+            connection.execute("UPDATE items SET path = ? WHERE id = ?", (owned, row["id"]))
+
+
+MIGRATIONS = (create_baseline_schema, migrate_saved_images)
+SCHEMA_VERSION = len(MIGRATIONS)
+
+
+def schema_version(connection: sqlite3.Connection) -> int:
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'metadata' AND type = 'table'").fetchone():
+        row = connection.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone()
+        if row is not None:
+            return int(row[0])
+    return 0
+
+
+def migrate(connection: sqlite3.Connection) -> None:
+    if schema_version(connection) == SCHEMA_VERSION:
+        return
+    with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        version = schema_version(connection)
+        if not 0 <= version <= SCHEMA_VERSION:
+            raise ValueError(f"Unsupported Snip schema version {version}")
+        for step, migration in enumerate(MIGRATIONS[version:], start=version + 1):
+            migration(connection)
+            connection.execute(
+                "INSERT INTO metadata(key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(step),),
+            )
+
+
 def connect() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DATABASE, timeout=5)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 5000")
-    connection.executescript(SCHEMA)
+    connection = sqlite3.connect(DATABASE)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
+        # SQLite can return BUSY immediately when two processes first enable WAL.
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                connection.execute("PRAGMA journal_mode = WAL").fetchone()
+                break
+            except sqlite3.OperationalError as error:
+                if "locked" not in str(error) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.02)
+        migrate(connection)
+    except Exception:
+        connection.close()
+        raise
     return connection
 
 
@@ -136,19 +202,21 @@ def editor_argv(value: str) -> list[str]:
     return []
 
 
-def load_config() -> dict[str, object]:
+def load_config(*, require_valid_file: bool = False) -> dict[str, object]:
     config = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
     warnings = []
     try:
         user = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-        if not isinstance(user, dict):
-            warnings.append("Config must be a JSON object; using defaults")
-            user = {}
     except FileNotFoundError:
         user = {}
     except (OSError, ValueError, RecursionError):
         warnings.append("Could not read config as JSON; using defaults")
         user = {}
+    if not isinstance(user, dict):
+        warnings.append("Config must be a JSON object; using defaults")
+        user = {}
+    if require_valid_file and warnings:
+        raise ValueError(warnings[0])
 
     for key, value in user.items():
         if key not in config:
@@ -200,27 +268,36 @@ def resolve_editor() -> list[str]:
     raise ValueError("No editor found; set editor in Snip's config, VISUAL, or EDITOR")
 
 
-def load_clipboard() -> list[dict[str, object]]:
+def read_clipboard() -> list:
     try:
         data = json.loads(CLIPBOARD_HISTORY.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
+    except (OSError, ValueError, RecursionError):
+        raise ValueError("Could not read clipboard history as JSON") from None
+    if not isinstance(data, list):
+        raise ValueError("Clipboard history must be a JSON array")
+    return data
+
+
+def load_clipboard() -> list[dict[str, object]]:
+    try:
+        data = read_clipboard()
+    except ValueError:
         return []
 
     entries: list[dict[str, object]] = []
-    if not isinstance(data, list):
-        return entries
-    for index, entry in enumerate(data):
+    for entry in data:
         if not isinstance(entry, dict):
             continue
         kind = entry.get("type", "text")
         if kind == "image":
-            path = str(entry.get("path", ""))
-            if not path:
+            path = entry.get("path", "")
+            if not path or not command_text(path):
                 continue
             entries.append(
                 {
-                    "historyIndex": index,
+                    "ref": content_hash("image", "", path),
                     "kind": "image",
+                    "imageMissing": image_missing(path),
                     "title": f"Screenshot · {entry.get('capturedAt', 'image')}",
                     "body": "",
                     "path": path,
@@ -233,11 +310,15 @@ def load_clipboard() -> list[dict[str, object]]:
         text = entry.get("text", "")
         if not isinstance(text, str) or not text.strip():
             continue
+        try:
+            ref = content_hash("text", text, "")
+        except UnicodeEncodeError:
+            continue
         lines = [line.strip() for line in text.splitlines() if line.strip()]
         subtitle = lines[1][:100] if len(lines) > 1 else f"{len(text.splitlines())} lines · {len(text)} chars"
         entries.append(
             {
-                "historyIndex": index,
+                "ref": ref,
                 "kind": "text",
                 "title": display_title(text),
                 "body": text,
@@ -249,48 +330,86 @@ def load_clipboard() -> list[dict[str, object]]:
     return entries
 
 
-def clipboard_entry(history_index: int) -> dict[str, object]:
+def clipboard_entry(ref: str) -> dict[str, object]:
     for entry in load_clipboard():
-        if entry["historyIndex"] == history_index:
+        if entry["ref"] == ref:
             return entry
-    raise ValueError("clipboard entry is no longer available")
+    raise ValueError("That clipboard item is no longer in history")
+
+
+def image_missing(path: str) -> bool:
+    try:
+        return not path or not Path(path).is_file()
+    except OSError:
+        return True
+
+
+def store_image(source: Path, digest: str) -> str:
+    if image_missing(str(source)):
+        raise ValueError(IMAGE_MISSING)
+    directory = DATA_DIR.resolve() / "images"
+    if directory.is_symlink():
+        raise ValueError("Snip's images directory must not be a symlink")
+    directory.mkdir(exist_ok=True)
+    if not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise ValueError("Invalid saved image hash")
+    # Keep the original clipboard digest as the saved item's identity.
+    suffix = source.suffix or ".img"
+    target = directory / (digest + suffix)
+    if target.is_symlink():
+        raise ValueError("Snip's saved image path must not be a symlink")
+    if target.is_file():
+        return str(target)
+    try:
+        os.link(source.resolve(), target)
+    except OSError as error:
+        if error.errno not in (errno.EXDEV, errno.EPERM):
+            raise
+        with tempfile.NamedTemporaryFile(dir=directory, delete=False) as temporary:
+            copy = Path(temporary.name)
+        try:
+            shutil.copyfile(source, copy)
+            copy.replace(target)
+        finally:
+            copy.unlink(missing_ok=True)
+    return str(target)
+
+
+def delete_item(connection: sqlite3.Connection, item: sqlite3.Row) -> None:
+    connection.execute("DELETE FROM items WHERE id = ?", (item["id"],))
+    if item["kind"] != "image" or not item["path"]:
+        return
+    path = Path(item["path"])
+    if path.parent.resolve() != DATA_DIR.resolve() / "images":
+        return
+    for row in connection.execute("SELECT path FROM items WHERE kind = 'image'"):
+        if Path(row["path"]).resolve() == path.resolve():
+            return
+    path.unlink(missing_ok=True)
 
 
 def upsert_clipboard_item(
     connection: sqlite3.Connection,
-    history_index: int,
+    ref: str,
     *,
     category_id: int | None = None,
     pin: bool = False,
 ) -> int:
-    entry = clipboard_entry(history_index)
-    kind = str(entry["kind"])
-    body = str(entry["body"])
-    path = str(entry["path"])
-    digest = content_hash(kind, body, path)
-    with connection:
-        connection.execute(
-            "INSERT INTO items "
-            "(category_id, kind, title, body, path, mime, content_hash, pinned) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(content_hash) DO UPDATE SET "
-            "category_id = COALESCE(excluded.category_id, items.category_id), "
-            "pinned = MAX(items.pinned, excluded.pinned), "
-            "updated_at = CURRENT_TIMESTAMP",
-            (
-                category_id,
-                kind,
-                entry["title"],
-                body,
-                path,
-                entry["mime"],
-                digest,
-                int(pin),
-            ),
-        )
-        row = connection.execute(
-            "SELECT id FROM items WHERE content_hash = ?", (digest,)
-        ).fetchone()
+    entry = clipboard_entry(ref)
+    kind = entry["kind"]
+    path = entry["path"]
+    if kind == "image":
+        path = store_image(Path(path), ref)
+    row = connection.execute(
+        "INSERT INTO items "
+        "(category_id, kind, title, body, path, mime, content_hash, pinned) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(content_hash) DO UPDATE SET "
+        "category_id = COALESCE(excluded.category_id, items.category_id), "
+        "pinned = MAX(items.pinned, excluded.pinned), path = excluded.path, "
+        "updated_at = CURRENT_TIMESTAMP RETURNING id",
+        (category_id, kind, entry["title"], entry["body"], path, entry["mime"], ref, int(pin)),
+    ).fetchone()
     return int(row[0])
 
 
@@ -314,6 +433,8 @@ def snapshot(connection: sqlite3.Connection) -> dict[str, object]:
     ]
     for item in items:
         item["pinned"] = bool(item["pinned"])
+        if item["kind"] == "image":
+            item["imageMissing"] = image_missing(item["path"])
         body = item["body"]
         lines = [line.strip() for line in body.splitlines() if line.strip()]
         item["subtitle"] = lines[0][:100] if lines else item["categoryName"]
@@ -325,16 +446,146 @@ def snapshot(connection: sqlite3.Connection) -> dict[str, object]:
     }
 
 
+def run_command(
+    argv: list[str], failure: str, *, terminal=None, fail_on_stderr: bool = False
+) -> subprocess.CompletedProcess:
+    # The clipboard owner can outlive the paste helper. Avoid pipes it could
+    # hold open, while still detecting errors the helper prints but masks.
+    log = tempfile.TemporaryFile(dir=os.environ.get("XDG_RUNTIME_DIR") or None) if fail_on_stderr else nullcontext()
+    with log as diagnostics:
+        try:
+            result = subprocess.run(
+                argv, stdout=subprocess.DEVNULL if diagnostics else terminal or subprocess.PIPE,
+                stderr=diagnostics or terminal or subprocess.PIPE,
+                encoding="utf-8", errors="replace", check=False,
+            )
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise ValueError(failure) from None
+        if result.returncode:
+            raise ValueError(failure)
+        if diagnostics:
+            diagnostics.seek(0)
+            if diagnostics.read().strip():
+                raise ValueError(failure)
+        return result
+
+
+def paste_tool() -> str | None:
+    omarchy = os.environ.get("OMARCHY_PATH")
+    if omarchy:
+        bundled = shutil.which(str(Path(omarchy).absolute() / "bin" / PASTE_TOOL))
+        if bundled:
+            return bundled
+    return shutil.which(PASTE_TOOL)
+
+
+def require_tool(name: str) -> None:
+    if not shutil.which(name):
+        raise ValueError(f"{name} not found on PATH")
+
+
+def paste_item(item: sqlite3.Row | dict[str, object], copy_only: bool) -> None:
+    is_image = item["kind"] == "image"
+    if is_image and image_missing(item["path"]):
+        raise ValueError(IMAGE_MISSING)
+    tool = paste_tool()
+    if not tool:
+        raise ValueError(f"{PASTE_TOOL} not found in OMARCHY_PATH or on PATH")
+    require_tool("wl-copy")
+    if not copy_only:
+        require_tool("wtype")
+    argv = [tool, "--copy-only"] if copy_only else [tool]
+    failure = ("Omarchy could not copy the item; check wl-copy" if copy_only else
+               "Omarchy could not paste the item; check wl-copy and wtype")
+    # Some versions of the helper report wl-copy errors on stderr but exit 0.
+    if is_image:
+        run_command([*argv, item["mime"], item["path"]], failure, fail_on_stderr=True)
+        return
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", prefix="snip-paste-",
+            dir=os.environ.get("XDG_RUNTIME_DIR") or None, delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(item["body"])
+        run_command([*argv, TEXT_MIME, str(temporary_path)], failure, fail_on_stderr=True)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
 def current_clipboard_text() -> str:
-    result = subprocess.run(
-        ["wl-paste", "--type", "text", "--no-newline"],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    require_tool("wl-paste")
+    result = run_command(["wl-paste", "--type", "text", "--no-newline"],
+                         "Could not read text from the clipboard with wl-paste")
     if not result.stdout.strip():
         raise ValueError("clipboard is empty or does not contain text")
     return result.stdout
+
+
+def edit_file(editor: list[str], path: Path) -> None:
+    argv = [*editor, str(path)]
+    failure = "The editor could not finish editing the snippet"
+    # Keep the interactive editor on the terminal without mixing its output
+    # into the backend's JSON result or stderr diagnostic.
+    try:
+        terminal = open("/dev/tty", "w", encoding="utf-8") if sys.stdin.isatty() else None
+    except OSError:
+        terminal = None
+    with terminal or nullcontext():
+        run_command(argv, failure, terminal=terminal)
+
+
+def doctor() -> int:
+    required_ok = True
+
+    def check(label: str, ok: bool, hint: str, *, required: bool = True) -> None:
+        nonlocal required_ok
+        if required and not ok:
+            required_ok = False
+        print(f"{'✓' if ok else '✗'} {label} — {'OK' if ok else hint}")
+
+    check(f"Python {sys.version.split()[0]}", sys.version_info >= (3, 10), "Use Python 3.10 or newer")
+    check(PASTE_TOOL, paste_tool() is not None, "Use Omarchy 4 or check OMARCHY_PATH and PATH")
+    for tool in ("wl-copy", "wl-paste", "wtype"):
+        check(tool, shutil.which(tool) is not None, f"Install {'wtype' if tool == 'wtype' else 'wl-clipboard'}")
+    check("xdg-terminal-exec", shutil.which("xdg-terminal-exec") is not None,
+          "Set terminal in Snip's config or install xdg-terminal-exec", required=False)
+    try:
+        read_clipboard()
+    except ValueError:
+        check("Clipboard history", False, "Enable omarchy.clipboard and copy an item", required=False)
+    else:
+        check("Clipboard history", True, "")
+    try:
+        config = load_config(require_valid_file=True)
+    except (OSError, ValueError) as error:
+        check("Config", False, f"Fix {CONFIG_FILE}: {error}")
+    else:
+        check("Config", True, "")
+        for warning in config["warnings"]:
+            check("Config warning", False, warning, required=False)
+    try:
+        with closing(connect()) as connection:
+            integrity = [row[0] for row in connection.execute("PRAGMA integrity_check")]
+            db_ok = integrity == ["ok"] and schema_version(connection) == SCHEMA_VERSION
+    except (OSError, sqlite3.Error, ValueError):
+        db_ok = False
+    check(f"Database (schema {SCHEMA_VERSION})", db_ok, f"Check access to {DATABASE} or restore a backup")
+    if shutil.which("hyprctl"):
+        try:
+            result = run_command(["hyprctl", "binds", "-j"], "Could not read Hyprland bindings")
+            binds = json.loads(result.stdout)
+            token = re.compile(rf"(?<![\w.-]){re.escape(PLUGIN_ID)}(?![\w.-])")
+            bound = isinstance(binds, list) and any(
+                isinstance(bind, dict) and token.search(str(bind.get("arg", ""))) for bind in binds
+            )
+        except ValueError:
+            bound = False
+        check("Hyprland binding", bound,
+              f'Add o.rebind("SUPER + CTRL + V", "Snip", {{ panel = "{PLUGIN_ID}" }})', required=False)
+    return 0 if required_ok else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -360,15 +611,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     pin = subparsers.add_parser("pin-inbox")
-    pin.add_argument("history_index", type=int)
+    pin.add_argument("--ref", required=True)
 
     save = subparsers.add_parser("save-inbox")
-    save.add_argument("history_index", type=int)
+    save.add_argument("--ref", required=True)
     save.add_argument("category_id", type=int)
 
     save_new = subparsers.add_parser("save-inbox-new")
-    save_new.add_argument("history_index", type=int)
+    save_new.add_argument("--ref", required=True)
     save_new.add_argument("name")
+
+    paste = subparsers.add_parser("paste")
+    source = paste.add_mutually_exclusive_group(required=True)
+    source.add_argument("--id", type=int)
+    source.add_argument("--ref")
+    paste.add_argument("--copy-only", action="store_true")
+    subparsers.add_parser("doctor")
 
     toggle = subparsers.add_parser("toggle-pin")
     toggle.add_argument("item_id", type=int)
@@ -407,50 +665,34 @@ def category_id_for(connection: sqlite3.Connection, spec: str) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) == 1:
-        try:
-            return subprocess.run(
-                ["omarchy-shell", "shell", "toggle", "themaxcoder.snip", "{}"],
-                check=False,
-            ).returncode
-        except OSError as error:
-            print(f"snip: {error}", file=sys.stderr)
-            return 1
-
-    args = build_parser().parse_args()
     try:
+        if len(sys.argv) == 1:
+            result = run_command(["omarchy-shell", "shell", "toggle", PLUGIN_ID, "{}"],
+                                 "Could not open Snip through omarchy-shell")
+            sys.stdout.write(result.stdout)
+            return 0
+        args = build_parser().parse_args()
         if args.command == "config":
             output(load_config())
             return 0
-        with connect() as connection:
+        if args.command == "doctor":
+            return doctor()
+        with closing(connect()) as connection:
             if args.command == "snapshot":
                 output(snapshot(connection))
-            elif args.command == "pin-inbox":
-                output(
-                    {
-                        "ok": True,
-                        "id": upsert_clipboard_item(
-                            connection, args.history_index, pin=True
-                        ),
-                    }
-                )
-            elif args.command == "save-inbox":
-                category_id_for(connection, str(args.category_id))
-                output(
-                    {
-                        "ok": True,
-                        "id": upsert_clipboard_item(
-                            connection,
-                            args.history_index,
-                            category_id=args.category_id,
-                        ),
-                    }
-                )
+            elif args.command in ("pin-inbox", "save-inbox"):
+                with connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    pin = args.command == "pin-inbox"
+                    category_id = None if pin else category_id_for(connection, str(args.category_id))
+                    item_id = upsert_clipboard_item(connection, args.ref, category_id=category_id, pin=pin)
+                output({"ok": True, "id": item_id})
             elif args.command == "save-inbox-new":
                 name = args.name.strip()
                 if not name:
                     raise ValueError("category name cannot be empty")
                 with connection:
+                    connection.execute("BEGIN IMMEDIATE")
                     order = connection.execute(
                         "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM categories"
                     ).fetchone()[0]
@@ -460,36 +702,25 @@ def main() -> int:
                     )
                     category_id = category_id_for(connection, name)
                     item_id = upsert_clipboard_item(
-                        connection, args.history_index, category_id=category_id
+                        connection, args.ref, category_id=category_id
                     )
                 output({"ok": True, "id": item_id, "categoryId": category_id})
-            elif args.command == "toggle-pin":
+            elif args.command in ("toggle-pin", "delete"):
                 with connection:
+                    connection.execute("BEGIN IMMEDIATE")
                     item = connection.execute(
-                        "SELECT category_id, pinned FROM items WHERE id = ?",
+                        "SELECT id, category_id, pinned, kind, path FROM items WHERE id = ?",
                         (args.item_id,),
                     ).fetchone()
                     if item is None:
                         raise ValueError("snippet no longer exists")
-                    if item["category_id"] is None and item["pinned"]:
-                        cursor = connection.execute(
-                            "DELETE FROM items WHERE id = ?", (args.item_id,)
-                        )
+                    if args.command == "delete" or (item["category_id"] is None and item["pinned"]):
+                        delete_item(connection, item)
                     else:
-                        cursor = connection.execute(
+                        connection.execute(
                             "UPDATE items SET pinned = NOT pinned, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                             (args.item_id,),
                         )
-                if cursor.rowcount != 1:
-                    raise ValueError("snippet no longer exists")
-                output({"ok": True})
-            elif args.command == "delete":
-                with connection:
-                    cursor = connection.execute(
-                        "DELETE FROM items WHERE id = ?", (args.item_id,)
-                    )
-                if cursor.rowcount != 1:
-                    raise ValueError("snippet no longer exists")
                 output({"ok": True})
             elif args.command == "delete-category":
                 category = connection.execute(
@@ -528,9 +759,7 @@ def main() -> int:
                     temporary.write(f"# {item['title']}\n\n{item['body']}\n")
                     edit_path = Path(temporary.name)
                 try:
-                    result = subprocess.run([*editor, str(edit_path)], check=False)
-                    if result.returncode != 0:
-                        raise ValueError("editor exited without saving")
+                    edit_file(editor, edit_path)
                     edited = edit_path.read_text(encoding="utf-8")
                 finally:
                     edit_path.unlink(missing_ok=True)
@@ -577,12 +806,23 @@ def main() -> int:
                         ),
                     )
                 output({"ok": True})
-            elif args.command == "used":
-                with connection:
-                    connection.execute(
-                        "UPDATE items SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (args.item_id,),
-                    )
+            elif args.command in ("paste", "used"):
+                item_id = args.item_id if args.command == "used" else args.id
+                if args.command == "paste":
+                    if args.ref is not None:
+                        item = clipboard_entry(args.ref)
+                    else:
+                        item = connection.execute(
+                            "SELECT kind, body, path, mime FROM items WHERE id = ?", (item_id,)
+                        ).fetchone()
+                        if item is None:
+                            raise ValueError("snippet no longer exists")
+                    paste_item(item, args.copy_only)
+                if item_id is not None:
+                    with connection:
+                        connection.execute(
+                            "UPDATE items SET last_used_at = CURRENT_TIMESTAMP WHERE id = ?", (item_id,)
+                        )
                 output({"ok": True})
     except (OSError, sqlite3.Error, subprocess.SubprocessError, ValueError) as error:
         print(f"snip: {error}", file=sys.stderr)
