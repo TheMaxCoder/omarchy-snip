@@ -1,0 +1,182 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# demo: Relaunch the Omarchy shell with a throwaway Snip library for screenshots.
+#
+#   scripts/demo         build the demo data and relaunch the shell against it
+#   scripts/demo --stop  restart the shell normally (your own library again)
+#
+# The shell reads SNIP_DATA_DIR, SNIP_CLIPBOARD_FILE, and SNIP_CONFIG_FILE, so
+# your real database, clipboard history, and config are never opened. The demo
+# lives in $XDG_RUNTIME_DIR and uses the default keys. Needs ImageMagick.
+
+if [[ ${1:-} == "--stop" ]]; then
+  exec omarchy restart shell
+fi
+
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+demo="${XDG_RUNTIME_DIR:-/tmp}/snip-demo"
+rm -rf -- "$demo"
+mkdir -p -- "$demo/images"
+
+export SNIP_DATA_DIR="$demo/data"
+export SNIP_CLIPBOARD_FILE="$demo/clipboard-history.json"
+export SNIP_CONFIG_FILE="$demo/config.json"
+echo '{}' >"$SNIP_CONFIG_FILE"
+echo '[]' >"$SNIP_CLIPBOARD_FILE"
+
+chart="$demo/images/build-times.png"
+font=$(fc-match -f '%{file}' monospace 2>/dev/null || true)
+bars=(300 260 330 210 170 120 90)
+draw=()
+for index in "${!bars[@]}"; do
+  x=$((90 + index * 120))
+  color='#89b4fa'
+  ((index >= 5)) && color='#a6e3a1'
+  draw+=(-fill "$color" -draw "rectangle $x,$((520 - bars[index])) $((x + 80)),520")
+done
+magick -size 960x600 xc:'#1e1e2e' ${font:+-font "$font"} \
+  -fill '#cdd6f4' -pointsize 30 -annotate +60+80 'CI build time this week (s)' \
+  -fill '#585b70' -draw 'line 60,520 900,520' "${draw[@]}" \
+  -fill '#a6adc8' -pointsize 22 -annotate +108+560 'Mon     Tue     Wed     Thu     Fri     Sat     Sun' \
+  "$chart"
+
+snip() { "$repo/bin/snip" "$@" >/dev/null; }
+add() { # add CATEGORY|"" TITLE [--pin], body on stdin
+  local category=$1 title=$2
+  shift 2
+  if [[ -n $category ]]; then
+    snip add --stdin --category "$category" --title "$title" "$@"
+  else
+    snip add --stdin --title "$title"
+  fi
+}
+
+add Prompts "Review this diff" --pin <<'EOF'
+Review the diff below as a senior engineer on this team.
+
+1. Correctness first: logic errors, unhandled cases, races, and data loss.
+2. Then security: input validation, secrets, and permissions.
+3. Then readability, only where it would confuse the next reader.
+
+For each finding give file:line, what breaks and for which input, and the
+smallest fix. Skip style nits a formatter would catch. If the change looks
+correct, say so in one line instead of inventing problems.
+EOF
+add Prompts "Summarize a long thread" <<'EOF'
+Summarize this thread in five bullets: decisions made, open questions,
+owners, deadlines, and anything blocked.
+EOF
+add Prompts "Explain an error" <<'EOF'
+Explain this error to a teammate who knows the codebase but not this library.
+Say what most likely caused it and the smallest change that fixes it.
+EOF
+add Prompts "Write a commit message" <<'EOF'
+Write a commit message for the staged diff: an imperative subject under
+60 characters, then a short body explaining why the change was needed.
+EOF
+add Prompts "Turn notes into a plan" <<'EOF'
+Turn these notes into a step-by-step plan. Mark what needs a decision,
+what can run in parallel, and what each step depends on.
+EOF
+add Prompts "Second opinion" <<'EOF'
+Here is my approach. Argue against it: what would make it fail, and what
+would you do instead? Be specific and skip the praise.
+EOF
+add Git "Undo last commit, keep changes" --pin <<'EOF'
+git reset --soft HEAD~1
+EOF
+add Git "Rebase onto main" <<'EOF'
+git fetch origin && git rebase --autostash origin/main
+EOF
+add Git "Delete merged branches" <<'EOF'
+git branch --merged main | grep -vE '^\*|\bmain$' | xargs -r git branch -d
+EOF
+add Git "Amend without editing the message" <<'EOF'
+git commit --amend --no-edit
+EOF
+add Git "Who changed this line?" <<'EOF'
+git log -L 42,42:src/main.rs --oneline
+EOF
+add Git "Stash including untracked files" <<'EOF'
+git stash push --include-untracked -m "wip"
+EOF
+add Shell "Biggest files here" <<'EOF'
+du -ah . 2>/dev/null | sort -rh | head -20
+EOF
+add Shell "What is using port 8080?" <<'EOF'
+ss -ltnp 'sport = :8080'
+EOF
+add Shell "Follow a service log" --pin <<'EOF'
+journalctl --user -f -u pipewire
+EOF
+add Shell "Find files changed today" <<'EOF'
+find . -type f -newermt today -not -path './.git/*'
+EOF
+add Shell "Serve this folder" <<'EOF'
+python -m http.server 8000 --bind 127.0.0.1
+EOF
+add Shell "Active window as JSON" <<'EOF'
+hyprctl activewindow -j | jq '{class, title, size}'
+EOF
+add Replies "Thanks, next steps" <<'EOF'
+Thanks for the quick review!
+I'll address the comments today and ping you once the new version is up.
+EOF
+add Replies "Not this sprint" <<'EOF'
+Thanks for thinking of me. This sprint is full, but I can pick it up next week.
+If it can't wait, Sam knows this area well.
+EOF
+add Replies "Need more detail" <<'EOF'
+Thanks for the report! Could you share the exact steps, what you expected,
+and what happened instead? A screenshot or log would help a lot.
+EOF
+add Replies "Running late" <<'EOF'
+Running about ten minutes late. Please start without me; I'll catch up.
+EOF
+add "" "Standup" <<'EOF'
+Yesterday: finished the export dialog and its tests.
+Today: review the import PR, then start on keyboard shortcuts.
+Blockers: none.
+EOF
+add "" "Weekly sync link" <<'EOF'
+https://meet.example.com/weekly-sync
+EOF
+
+python3 - "$SNIP_CLIPBOARD_FILE" "$chart" <<'EOF'
+import json, sys
+history, chart = sys.argv[1:]
+entries = [
+    {"type": "text", "text": "https://github.com/basecamp/omarchy"},
+    {"type": "image", "path": chart, "mime": "image/png", "capturedAt": "Today 10:42"},
+    {"type": "text", "text": "Ship it once CI is green. I'll write the release notes."},
+    {"type": "text", "text": "Release checklist\n- Tag v1.0.0\n- Update the screenshots\n- Publish the release notes\n- Announce it"},
+    {"type": "text", "text": "ffmpeg -i talk.mp4 -vf scale=1280:-2 -c:a copy talk-720p.mp4"},
+    {"type": "text", "text": "#89b4fa"},
+    {"type": "text", "text": "Meeting moved to Thursday 15:00. Same room, same agenda."},
+    {"type": "text", "text": "sudo pacman -Syu"},
+    {"type": "text", "text": "Order #4821 ships Monday; tracking will follow by email."},
+    {"type": "text", "text": "export EDITOR=nvim"},
+]
+with open(history, "w", encoding="utf-8") as file:
+    json.dump(entries, file, indent=2)
+EOF
+
+# The shell refuses to start beside a dying instance (-n), so wait for it to exit.
+shell_dir="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
+while timeout 30 quickshell kill -p "$shell_dir" --any-display >/dev/null 2>&1; do :; done
+for _ in {1..300}; do
+  quickshell list -a -j 2>/dev/null | jq -e --arg dir "$shell_dir/" \
+    'any(.[]; .config_path | startswith($dir))' >/dev/null || break
+  sleep 0.1
+done
+hyprctl dispatch "hl.dsp.exec_cmd(\"env SNIP_DATA_DIR=$SNIP_DATA_DIR SNIP_CLIPBOARD_FILE=$SNIP_CLIPBOARD_FILE SNIP_CONFIG_FILE=$SNIP_CONFIG_FILE omarchy-launch-shell\")" >/dev/null
+for _ in {1..600}; do
+  omarchy-shell shell ping >/dev/null 2>&1 && break
+  sleep 0.1
+done
+if ! omarchy-shell shell ping >/dev/null 2>&1; then
+  echo "The demo shell did not start; run: omarchy restart shell" >&2
+  exit 1
+fi
+echo "Demo shell running with data in $demo. Open Snip, take screenshots, then run: scripts/demo --stop"

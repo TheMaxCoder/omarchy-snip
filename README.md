@@ -2,7 +2,7 @@
 
 A keyboard-first Omarchy picker for saved snippets and clipboard history.
 
-![Screenshot placeholder — the author will replace it with a Snip screenshot.](docs/screenshot.png)
+![Snip showing a Prompts tab with a pinned snippet and its preview](docs/screenshot.png)
 
 ## Install and pick a shortcut
 
@@ -96,5 +96,7 @@ omarchy plugin remove themaxcoder.snip
 ```
 
 On uninstall, remove the Snip binding and optional CLI symlink if you added them. Removing the replacement binding restores the stock binding on reload if Omarchy's defaults are enabled. To permanently delete saved snippets and images, delete the Snip data directory listed above (back it up first if needed); you can also remove the Snip config file. This does not remove Omarchy's clipboard history.
+
+To take screenshots without showing your own library, run `scripts/demo`; it relaunches the shell against throwaway sample data, and `scripts/demo --stop` restores your own.
 
 [MIT license](LICENSE).
