@@ -49,7 +49,8 @@ one commit. A reviewer reads the diff between phases.
   It holds at most 500 entries, newest first, and drops sensitive entries.
   Text entry: `{"type":"text","text":…}`. Image entry: `{"type":"image","mime","path","capturedAt"}`.
 - `omarchy-clipboard-paste-text` accepts text only as a command-line argument (ARG_MAX risk).
-  `omarchy-clipboard-paste-file` is just `wl-copy --type MIME < path; sleep 0.15; wtype -M shift -k Insert -m shift`.
+  `omarchy-clipboard-paste-file [--copy-only] MIME PATH` runs `wl-copy --type MIME < PATH`, then
+  `sleep 0.15; wtype -M shift -k Insert -m shift`. Omarchy's own clipboard plugin uses it.
 - Theme palette file: `~/.local/state/omarchy/current/theme/colors.toml`. The
   `Color` singleton exposes only accent/urgent/muted/foreground/background plus
   surface roles (menu.*). The baseline's colors.toml parsing for green/orange/cyan stays.
@@ -170,27 +171,42 @@ Node tests load the `.js` files with `vm` after stripping the `.pragma library` 
    - The backend resolves a ref against the current history file. If it is gone,
      exit non-zero with "That clipboard item is no longer in history". Remove
      `historyIndex` from the JSON and the QML.
-2. **`snip paste` owns pasting.**
+2. **`snip paste` routes everything through Omarchy's file paste.**
    - Usage: `snip paste (--id N | --ref HASH) [--copy-only]`.
-   - Text is written to a 0600 temp file in `$XDG_RUNTIME_DIR`, then
-     `wl-copy --type "text/plain;charset=utf-8" < file`. Images:
-     `wl-copy --type MIME < path`.
-   - Unless copy-only: `sleep 0.15`, then `wtype -M shift -k Insert -m shift`.
-   - Delete the temp file in `finally`. Update `last_used_at` for saved items.
-   - Snip no longer calls any `omarchy-clipboard-paste-*` script, which removes
-     the ARG_MAX limit and an unstable dependency.
+   - Decision: reuse `omarchy-clipboard-paste-file [--copy-only] MIME PATH` so Snip
+     inherits Omarchy's paste behavior and any future improvements. Do not
+     reimplement wl-copy/wtype logic.
+   - Text: write the body to a 0600 temp file in `$XDG_RUNTIME_DIR` (fallback: the
+     system temp dir), call
+     `omarchy-clipboard-paste-file [--copy-only] "text/plain;charset=utf-8" FILE`
+     synchronously, and delete the file in `finally`. The script reads the file
+     with `wl-copy` before it exits, so deleting afterwards is safe. Images: call
+     it with the item's MIME and path.
+   - Resolve the script as `$OMARCHY_PATH/bin/omarchy-clipboard-paste-file`, then
+     on `PATH`. If it is missing, exit non-zero with one clear sentence; `doctor`
+     checks for it.
+   - Update `last_used_at` for saved items. Snip no longer calls
+     `omarchy-clipboard-paste-text`, which removes the ARG_MAX limit.
    - QML hides first, then `execDetached([backendPath, "paste", …])`. Copy-only
      stays open and shows "Copied".
-   - Test: a 1 MB body round-trips through `paste --copy-only`, with `wl-copy`
-     stubbed by a fake executable on `PATH` that records its stdin.
-3. **Durable saved images.**
-   - Saving an image item copies the file to `$DATA_DIR/images/<sha256>.<ext>`
-     and stores that path. Omarchy's history images can disappear.
-   - Add a schema migration that copies existing image rows still pointing
-     outside `$DATA_DIR`, when their source exists.
+   - Test: a 1 MB body round-trips through `paste --copy-only`, with
+     `omarchy-clipboard-paste-file` stubbed by a fake executable (through
+     `OMARCHY_PATH` or `PATH`) that records its arguments and the file contents.
+     The temp file must be gone afterwards.
+3. **Durable saved images through hard links.**
+   - Decision: no duplicated bytes and no toggle. Saving an image item hard-links
+     (`os.link`) the source file to `$DATA_DIR/images/<sha256>.<ext>` and stores
+     that path. Fall back to a real copy only when linking fails (`EXDEV` from a
+     different filesystem, or `EPERM`). Omarchy currently never deletes its history
+     images, but the link keeps Snip's image alive if it ever does.
+   - Add a schema migration that links (or copies, on failure) existing image rows
+     still pointing outside `$DATA_DIR`, when their source exists.
    - Rows whose file is missing render as "Image file missing" in preview, and
      paste fails with that message.
-   - Deleting an item deletes its owned image file when no other row references it.
+   - Deleting an item unlinks its file under `$DATA_DIR/images/` when no other row
+     references it. This never touches Omarchy's copy.
+   - Test: a saved image shares an inode with its source on the same filesystem,
+     and survives deletion of the source.
 4. **Schema versioning.**
    - Store `schema_version` in the existing `metadata` table and add an ordered
      migrations list, run in a transaction on connect.
@@ -203,7 +219,7 @@ Node tests load the `.js` files with `vm` after stripping the `.pragma library` 
    - `bin/snip doctor` prints a checklist with ✓/✗ and a fix hint per line, and
      exits non-zero if any required check fails:
      - Python version
-     - `wl-copy`, `wl-paste`, `wtype` on PATH (required)
+     - `omarchy-clipboard-paste-file`, `wl-copy`, `wl-paste`, `wtype` (required)
      - `xdg-terminal-exec` (warn)
      - clipboard history file exists and parses (warn: "enable omarchy.clipboard")
      - config parses, plus its warnings
