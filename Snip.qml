@@ -844,6 +844,16 @@ Item {
                 border.width: hasCursor ? 1 : 0
                 border.color: hasCursor ? root.navigationBorder : "transparent"
 
+                Rectangle {
+                  visible: snippetRow.hasCursor
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Math.max(2, Style.space(3))
+                  height: parent.height - Style.spacing.sm * 2
+                  radius: width / 2
+                  color: root.navigation
+                }
+
                 Column {
                   anchors.left: parent.left
                   anchors.right: pinIcon.left
