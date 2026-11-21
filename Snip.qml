@@ -213,8 +213,11 @@ Item {
     if (root.searchMode)
       return root.hints(root.searchKeys, [["move", "up", "down"], ["paste", "paste"],
         ["copy", "copy"], [root.searchText ? "clear search" : "navigation", "back"]])
+    var row = root.selectedItem
+    var itemAction = !row ? [] : row.source === "inbox" ? ["save", "save"]
+      : row.kind === "text" ? ["edit", "edit"] : []
     return root.hints(root.keymap, [["tabs", "prevTab", "nextTab"], ["move", "up", "down"],
-      ["ends", "first", "last"], ["pin", "pin"], ["save", "save"], ["edit", "edit"],
+      ["ends", "first", "last"], ["pin", "pin"], itemAction,
       ["delete", "delete"], ["tab +/−", "newTab", "deleteTab"], ["search", "search"],
       ["paste", "paste"], ["copy", "copy"], ["close", "back", "close"]])
   }
@@ -460,7 +463,8 @@ Item {
   function editSelected() {
     var row = root.selectedItem
     if (!row || row.source !== "saved") {
-      root.status("Save this Inbox item before editing", "warning")
+      var saveKey = root.keyHint(root.keymap, ["save"])
+      root.status("Only saved snippets can be edited" + (saveKey ? " · press " + saveKey + " to save this one to a tab" : ""), "warning")
       return
     }
     if (row.kind !== "text") {

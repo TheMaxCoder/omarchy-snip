@@ -45,7 +45,7 @@ ln -s ~/.config/omarchy/plugins/themaxcoder.snip/bin/snip ~/.local/bin/snip
 | Copy | `y`, `Ctrl+C`, `Super+C` |
 | Pin or unpin | `f` |
 | Save Inbox item to a tab | `s` |
-| Edit saved text | `i` |
+| Edit a saved text snippet (save Inbox items first) | `i` |
 | Delete item | `d` |
 | New tab | `Shift+N` |
 | Delete tab | `Shift+D` |
@@ -59,7 +59,7 @@ Digits `0`–`9` jump to tabs outside the save and new-tab dialogs. Press `/` fo
 
 Create `${XDG_CONFIG_HOME:-~/.config}/snip/config.json` using [the example and defaults](config.example.json). Set `"startInSearch": true` to start in search mode. Each `keys` override replaces that action's list; `[]` disables it, except that `Return`/`Enter` and `Escape` remain reserved in text inputs. See `snip config --help` for key syntax and `snip config` for effective settings and warnings.
 
-Press `i` on a saved text snippet. Snip uses your `terminal` argv array if set, otherwise `xdg-terminal-exec` opens a floating terminal. It selects the first available editor from `editor` in the config, `$VISUAL`, `$EDITOR`, `nvim`, `vim`, and `nano`. The first line is the title; the rest is the body.
+Press `i` on a text snippet in one of your tabs; Inbox items must be saved with `s` first, and the footer shows `edit` only when it applies. Snip uses your `terminal` argv array if set, otherwise `xdg-terminal-exec` opens a floating terminal. It selects the first available editor from `editor` in the config, `$VISUAL`, `$EDITOR`, `nvim`, `vim`, and `nano`. The first line is the title; the rest is the body.
 
 ## Capture, import, and export
 
