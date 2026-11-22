@@ -7,6 +7,7 @@ import qs.Commons as Commons
 import qs.Ui
 import "Keys.js" as KeyBindings
 import "Search.js" as Search
+import "Pointer.js" as Pointer
 
 Item {
   id: root
@@ -29,6 +30,7 @@ Item {
   property int currentTab: 0
   property int selectedIndex: 0
   property bool cursorActive: true
+  property var pointerPosition: null
   property var categories: []
   property var savedItems: []
   property var inboxItems: []
@@ -88,6 +90,7 @@ Item {
 
   function open(payload) {
     root.close(null)
+    root.pointerPosition = null
     root.searchMode = Boolean(root.config.startInSearch)
     root.rebuildDisplay()
     root.startModePending = true
@@ -360,6 +363,23 @@ Item {
     root.selectedItem = root.displayRows[index] || null
   }
 
+  function selectFromPointer(position) {
+    if (!root.opened) return
+    var previous = root.pointerPosition
+    var next = Pointer.advance(previous, position.x, position.y)
+    if (next === previous) return
+    root.pointerPosition = next
+    if (!previous || root.savePickerOpen || root.categoryInputOpen) return
+
+    var viewPoint = resultList.mapFromItem(null, position)
+    if (!resultList.contains(viewPoint)) return
+    var contentPoint = resultList.contentItem.mapFromItem(resultList, viewPoint)
+    var index = resultList.indexAt(contentPoint.x, contentPoint.y)
+    if (index < 0) return
+    root.cursorActive = true
+    root.updateSelection(index)
+  }
+
   function select(delta) {
     if (root.displayRows.length === 0) return
     root.updateSelection((root.selectedIndex + delta + root.displayRows.length) % root.displayRows.length)
@@ -613,6 +633,12 @@ Item {
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.Exclusive
     exclusionMode: ExclusionMode.Ignore
 
+    // Observe the whole window without taking events away from the row clicks.
+    HoverHandler {
+      parent: panel.contentItem
+      onPointChanged: if (hovered) root.selectFromPointer(point.scenePosition)
+    }
+
     Rectangle {
       anchors.fill: parent
       color: root.scrim
@@ -758,6 +784,7 @@ Item {
                   id: tabLabel
                   anchors.centerIn: parent
                   text: index + "  " + root.tabName(index)
+                  textFormat: Text.PlainText
                   color: index === root.currentTab
                     ? root.navigation
                     : (index === 1 ? root.success : root.muted)
@@ -787,6 +814,7 @@ Item {
             anchors.right: searchCount.left
             anchors.verticalCenter: parent.verticalCenter
             text: "󰍉  " + (root.searchText || "Search saved snippets and clipboard…") + (root.searchText ? "▍" : "")
+            textFormat: Text.PlainText
             color: root.searchText ? root.foreground : root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.title
@@ -865,6 +893,7 @@ Item {
                   Text {
                     width: parent.width
                     text: snippetRow.modelData.title
+                    textFormat: Text.PlainText
                     color: parent.parent.hasCursor ? root.navigation : root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.body
@@ -875,6 +904,7 @@ Item {
                   Text {
                     width: parent.width
                     text: root.searchMode ? snippetRow.modelData.categoryName : snippetRow.modelData.subtitle
+                    textFormat: Text.PlainText
                     color: root.muted
                     font.family: root.fontFamily
                     font.pixelSize: Style.font.caption
@@ -897,10 +927,6 @@ Item {
                   anchors.fill: parent
                   hoverEnabled: true
                   cursorShape: Qt.PointingHandCursor
-                  onContainsMouseChanged: if (containsMouse) {
-                    root.cursorActive = true
-                    root.updateSelection(index)
-                  }
                   onClicked: {
                     root.updateSelection(index)
                     root.pasteSelected(false)
@@ -1078,6 +1104,7 @@ Item {
                 anchors.margins: Style.spacing.controlPaddingX
                 verticalAlignment: Text.AlignVCenter
                 text: root.categoryInput ? root.categoryInput + "▍" : "Category name…"
+                textFormat: Text.PlainText
                 color: root.categoryInput ? root.foreground : root.selectedText
                 opacity: root.categoryInput ? 1 : 0.6
                 font.family: root.fontFamily
@@ -1101,6 +1128,7 @@ Item {
                   anchors.leftMargin: Style.spacing.controlPaddingX
                   anchors.verticalCenter: parent.verticalCenter
                   text: index === root.categories.length ? "＋  Create new tab…" : root.categories[index].name
+                  textFormat: Text.PlainText
                   color: index === root.saveCategoryIndex ? root.selectedText
                     : (index === root.categories.length ? root.accent : root.foreground)
                   font.family: root.fontFamily
