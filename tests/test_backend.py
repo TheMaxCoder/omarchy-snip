@@ -104,6 +104,21 @@ root = Path(os.environ['HOME'])
         stub.chmod(0o700)
         return stub
 
+    def add_text(self, body, category=None, *, pinned=False):
+        args = ["--category", category] if category is not None else []
+        if pinned:
+            args.append("--pin")
+        return self.snip("add", "--stdin", *args, stdin=body)
+
+    def tab_orders(self, snapshot=None):
+        data = self.snip("snapshot") if snapshot is None else snapshot
+        items = data["items"]
+        return {
+            None: [item["title"] for item in items if item["pinned"]],
+            **{tab["name"]: [item["title"] for item in items if item["categoryId"] == tab["id"]]
+               for tab in data["categories"]},
+        }
+
     def test_library_workflow(self):
         fresh = self.snip("snapshot")
         self.assertEqual(fresh["categories"], [])
@@ -385,8 +400,10 @@ exit 1''')
         item_id = self.snip("pin-inbox", "--ref", self.ref())["id"]
         owned = Path(self.snip("snapshot")["items"][0]["path"])
         with closing(sqlite3.connect(Path(self.env["SNIP_DATA_DIR"]) / "snip.db")) as db, db:
-            cursor = db.execute("INSERT INTO items(kind, title, path, content_hash) VALUES ('image', ?, ?, ?)",
-                                ("Also used", str(owned), "fixture-hash"))
+            cursor = db.execute(
+                "INSERT INTO items(kind, title, path, content_hash, position) VALUES ('image', ?, ?, ?, 1)",
+                ("Also used", str(owned), "fixture-hash"),
+            )
             other_id = cursor.lastrowid
         self.snip("delete", item_id)
         self.assertTrue(owned.samefile(source))
@@ -454,9 +471,162 @@ with patch.object(os, 'link', side_effect=OSError(int(error), os.strerror(int(er
             self.assertTrue(owned.samefile(source))
             self.assertEqual(rows[1], (*original[1][:4], str(owned), *original[1][5:]))
             self.assertEqual(dict(db.execute("SELECT key, value FROM metadata")),
-                             {"legacy_migrated": "2026-01-01", "schema_version": "2"})
+                             {"legacy_migrated": "2026-01-01", "schema_version": "3"})
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(self.snip("snapshot"), snapshot)
+
+    def test_schema_2_migration_preserves_order_in_every_tab(self):
+        data_dir = Path(self.env["SNIP_DATA_DIR"])
+        data_dir.mkdir()
+        earlier, later = "2026-01-01 00:00:00", "2026-01-02 00:00:00"
+        with closing(sqlite3.connect(data_dir / "snip.db")) as db:
+            db.executescript((REPO / "tests/baseline-schema.sql").read_text())
+            with db:
+                # Version 2 moved image files; its table definitions are still the baseline's.
+                db.execute("INSERT INTO metadata VALUES ('schema_version', '2')")
+                db.execute("INSERT INTO categories(id, name, sort_order) VALUES (1, 'A', 1), (2, 'B', 2)")
+                db.executemany(
+                    "INSERT INTO items(id, category_id, kind, title, content_hash, pinned, updated_at, last_used_at) "
+                    "VALUES (?, ?, 'text', ?, ?, ?, ?, ?)",
+                    [(1, 1, "Used", "a", 1, earlier, later),
+                     (2, 2, "Pinned only by flag", "b", 1, later, None),
+                     (3, 1, "Edited after use", "c", 1, later, earlier),
+                     (4, 1, "Older ID", "d", 0, later, None),
+                     (5, 1, "Newer ID", "e", 0, later, None),
+                     (6, 2, "Other tab", "f", 0, later, None)],
+                )
+            migrated = self.snip("snapshot")
+            self.assertEqual(self.tab_orders(migrated), {
+                None: ["Pinned only by flag", "Used", "Edited after use"],
+                "A": ["Used", "Edited after use", "Newer ID", "Older ID"],
+                "B": ["Pinned only by flag", "Other tab"],
+            })
+            self.assertEqual(db.execute("SELECT value FROM metadata WHERE key = 'schema_version'").fetchone(), ("3",))
+            self.assertEqual(self.snip("snapshot"), migrated)
+
+    def test_snapshot_refuses_future_and_unreadable_schema(self):
+        data_dir = Path(self.env["SNIP_DATA_DIR"])
+        data_dir.mkdir()
+        database = data_dir / "snip.db"
+        database.write_bytes(b"not a database")
+        self.assertEqual(self.snip("snapshot", success=False).splitlines(), ["snip: file is not a database"])
+        database.unlink()
+        with closing(sqlite3.connect(database)) as db:
+            db.executescript("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+                             "INSERT INTO metadata VALUES ('schema_version', '99');")
+            self.assertEqual(self.snip("snapshot", success=False).splitlines(),
+                             ["snip: Unsupported Snip schema version 99"])
+            self.assertEqual(db.execute("SELECT value FROM metadata").fetchone(), ("99",))
+
+    def test_new_and_resaved_items_go_to_the_top_of_their_group(self):
+        older = self.add_text("Older", "Work")
+        self.add_text("Pinned", "Work", pinned=True)
+        self.add_text("Newer", "Work")
+        self.assertEqual(self.tab_orders()["Work"], ["Pinned", "Newer", "Older"])
+        self.snip("used", older["id"])
+        self.assertEqual(self.add_text("Older", "Work")["id"], older["id"])
+        self.assertEqual(self.tab_orders()["Work"], ["Pinned", "Older", "Newer"])
+
+        self.write_history("First Inbox", "Second Inbox", "Older", "Pinned")
+        refs = {row["title"]: row["ref"] for row in self.snip("snapshot")["inbox"]}
+        self.snip("save-inbox-new", "--ref", refs["First Inbox"], "New tab")
+        self.snip("save-inbox-new", "--ref", refs["Second Inbox"], "New tab")
+        self.assertEqual(self.tab_orders()["New tab"], ["Second Inbox", "First Inbox"])
+        for title in ("First Inbox", "Older"):
+            self.snip("save-inbox", "--ref", refs[title], older["categoryId"])
+        self.assertEqual(self.tab_orders()["Work"], ["Pinned", "Older", "First Inbox", "Newer"])
+        self.snip("pin-inbox", "--ref", refs["Second Inbox"])
+        self.assertEqual(self.tab_orders()[None], ["Second Inbox", "Pinned"])
+        self.snip("pin-inbox", "--ref", refs["Pinned"])
+        self.assertEqual(self.tab_orders()[None], ["Pinned", "Second Inbox"])
+        self.snip("save-inbox", "--ref", refs["Second Inbox"], older["categoryId"])
+        self.assertEqual(self.tab_orders()["Work"], ["Second Inbox", "Pinned", "Older", "First Inbox", "Newer"])
+
+    def test_pin_and_unpin_go_to_the_top_of_the_destination_group(self):
+        item = self.add_text("Move me", "Work")
+        self.add_text("Unpinned", "Work")
+        self.add_text("Work pin", "Work", pinned=True)
+        outside = self.add_text("Pinned only")
+        self.snip("toggle-pin", item["id"])
+        self.assertEqual(self.tab_orders(), {
+            None: ["Move me", "Pinned only", "Work pin"], "Work": ["Move me", "Work pin", "Unpinned"],
+        })
+        self.snip("toggle-pin", item["id"])
+        self.assertEqual(self.tab_orders()["Work"], ["Work pin", "Move me", "Unpinned"])
+        self.snip("toggle-pin", outside["id"])
+        self.assertEqual(self.tab_orders()[None], ["Work pin"])
+        self.assertNotIn(outside["id"], [row["id"] for row in self.snip("snapshot")["items"]])
+
+    def test_use_paste_copy_and_edit_do_not_reorder(self):
+        item = self.add_text("First", "Work")
+        second = self.add_text("Second", "Work")
+        self.add_text("Third", "Work")
+        self.paste_stub()
+        for args in (("used", item["id"]), ("paste", "--id", second["id"], "--copy-only"),
+                     ("paste", "--id", item["id"])):
+            self.snip(*args)
+            self.assertEqual(self.tab_orders()["Work"], ["Third", "Second", "First"])
+        self.env["EDITOR"] = str(self.executable(
+            "fake-editor", r'''printf '# Edited\n\nNew body\n' > "$1"'''
+        ))
+        self.snip("edit", item["id"])
+        self.assertEqual(self.tab_orders()["Work"], ["Third", "Second", "Edited"])
+
+    def test_swap_returns_snapshot_and_leaves_other_items_in_relative_order(self):
+        first = self.add_text("A", "Work", pinned=True)
+        self.add_text("B", "Other", pinned=True)
+        second = self.add_text("C", "Work", pinned=True)
+        self.add_text("D", "Other", pinned=True)
+        unpinned = self.add_text("E", "Work")
+        before = self.snip("snapshot")
+        for args, error in (
+            ((first["id"], 99), "snippet no longer exists"),
+            ((2**63, second["id"]), "snippet no longer exists"),
+            ((first["id"], first["id"]), "choose two different snippets to swap"),
+            ((second["id"], unpinned["id"]), "cannot swap pinned and unpinned snippets"),
+        ):
+            rejected = self.run_snip("swap-order", *args)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertEqual(rejected.stdout, "")
+            self.assertEqual(rejected.stderr.splitlines(), [f"snip: {error}"])
+            self.assertEqual(self.snip("snapshot"), before)
+        swapped = self.snip("swap-order", first["id"], second["id"])
+        self.assertEqual(swapped, self.snip("snapshot"))
+        self.assertEqual(self.tab_orders(swapped), {
+            None: ["D", "A", "B", "C"], "Work": ["A", "C", "E"], "Other": ["D", "B"],
+        })
+
+    def test_deleted_tab_moves_to_pinned_as_a_block_in_display_order(self):
+        first = self.add_text("Pin 1", "Work", pinned=True)
+        second = self.add_text("Pin 2", "Work", pinned=True)
+        self.add_text("Unpinned 1", "Work")
+        self.add_text("Unpinned 2", "Work")
+        self.add_text("Keep 1", "Other", pinned=True)
+        self.add_text("Keep 2")
+        self.snip("swap-order", first["id"], second["id"])
+        moved = self.tab_orders()["Work"]
+        self.assertEqual(self.snip("delete-category", first["categoryId"])["moved"], len(moved))
+        self.assertEqual(self.tab_orders(), {None: moved + ["Keep 2", "Keep 1"], "Other": ["Keep 1"]})
+
+    def test_positions_are_unique_after_import_and_concurrent_writes(self):
+        titles = [f"Imported {index}" for index in range(128)]
+        source = self.root / "Work.md"
+        source.write_text("".join(f"## {title}\n{title} body\n\n" for title in titles))
+        self.assertEqual(self.snip("import", source), {"imported": len(titles), "skipped": 0})
+        first, second = [item["id"] for item in self.snip("snapshot")["items"][:2]]
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            inserts = [pool.submit(self.add_text, f"Added {index}", "Work") for index in range(16)]
+            swaps = [pool.submit(self.snip, "swap-order", first, second) for _ in range(5)]
+            for task in inserts + swaps:
+                task.result()
+        self.assertEqual(self.tab_orders()["Work"][16:], [titles[1], titles[0], *titles[2:]])
+        swapped = self.snip("swap-order", first, second)
+        self.assertEqual(self.tab_orders(swapped)["Work"][16:], titles)
+        with closing(sqlite3.connect(Path(self.env["SNIP_DATA_DIR"]) / "snip.db")) as db:
+            self.assertEqual(db.execute("SELECT COUNT(*), COUNT(DISTINCT position) FROM items").fetchone(), (144, 144))
+            with self.assertRaises(sqlite3.IntegrityError), db:
+                db.execute("UPDATE items SET position = (SELECT position FROM items WHERE id = ?) WHERE id = ?",
+                           (first, second))
 
     def test_doctor_reports_requirements_and_nonfatal_warnings(self):
         self.paste_stub(bundled=True)
@@ -473,7 +643,7 @@ with patch.object(os, 'link', side_effect=OSError(int(error), os.strerror(int(er
         result = self.run_snip("doctor")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for label in ("Python", "omarchy-clipboard-paste-file", "wl-copy", "wl-paste", "wtype",
-                      "xdg-terminal-exec", "Clipboard history", "Config", "Database (schema 2)", "Hyprland binding"):
+                      "xdg-terminal-exec", "Clipboard history", "Config", "Database (schema 3)", "Hyprland binding"):
             self.assertIn(f"✓ {label}", result.stdout)
 
         self.history.write_text("not JSON")
@@ -508,7 +678,7 @@ with patch.object(os, 'link', side_effect=OSError(int(error), os.strerror(int(er
         (data_dir / "snip.db").write_text("not a database")
         result = self.run_snip("doctor")
         self.assertNotEqual(result.returncode, 0)
-        for label in ("omarchy-clipboard-paste-file", "wl-copy", "wl-paste", "wtype", "Config", "Database (schema 2)"):
+        for label in ("omarchy-clipboard-paste-file", "wl-copy", "wl-paste", "wtype", "Config", "Database (schema 3)"):
             self.assertIn(f"✗ {label} — ", result.stdout)
 
     def test_snapshots_and_last_used_writes_can_race(self):
@@ -630,11 +800,45 @@ exit 1''')
             self.assertEqual(item, expected)
         self.assertFalse(from_backup)
 
+    def test_json_preserves_swapped_order_and_prepends_only_new_items(self):
+        first = self.add_text("A", "Work", pinned=True)
+        self.add_text("B", "Other", pinned=True)
+        second = self.add_text("C", "Work", pinned=True)
+        third = self.add_text("D", "Work")
+        fourth = self.add_text("E", "Work")
+        self.snip("swap-order", first["id"], second["id"])
+        self.snip("swap-order", third["id"], fourth["id"])
+        source = self.root / "ordered.json"
+        result = self.run_snip("export", "--output", source)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([item["title"] for item in json.loads(source.read_text())["items"]], list("ABCDE"))
+        expected = self.tab_orders()
+
+        self.env["SNIP_DATA_DIR"] = str(self.root / "empty")
+        self.assertEqual(self.snip("import", source), {"imported": 5, "skipped": 0})
+        self.assertEqual(self.tab_orders(), expected)
+
+        self.env["SNIP_DATA_DIR"] = str(self.root / "existing")
+        self.add_text("A", "Other", pinned=True)
+        self.add_text("Keep pinned", "Work", pinned=True)
+        self.add_text("D", "Work")
+        self.add_text("Keep unpinned", "Work")
+        self.assertEqual(self.snip("import", source), {"imported": 3, "skipped": 2})
+        self.assertEqual(self.tab_orders(), {
+            None: ["B", "C", "Keep pinned", "A"],
+            "Work": ["C", "Keep pinned", "E", "Keep unpinned", "D"], "Other": ["B", "A"],
+        })
+
     def test_markdown_round_trip_preserves_verbatim_bodies(self):
         examples = ["Short text", "\n## Nested heading\n```\ntext in code\n```\n\n",
                     "\nonly a leading newline and CRLF\r\n  ", "```unclosed\nplain text", "## Heading at start"]
+        example_ids = []
         for index, body in enumerate(examples):
-            self.snip("add", "--stdin", "--category", "Café notes", "--title", f"Example {index}", stdin=body + "\n")
+            item = self.snip("add", "--stdin", "--category", "Café notes", "--title", f"Example {index}", stdin=body + "\n")
+            example_ids.append(item["id"])
+        self.snip("swap-order", example_ids[0], example_ids[2])
+        self.snip("toggle-pin", example_ids[1])
+        example_order = ["Example 1", "Example 4", "Example 3", "Example 0", "Example 2"]
         self.snip("add", "--stdin", "--category", "Pinned", "--title", "Categorized", stdin="named Pinned")
         title = "Separator & &#10;\r\nSecond line"
         self.snip("add", "--stdin", "--category", "A/B%20", "--title", title, stdin="category path")
@@ -649,6 +853,7 @@ exit 1''')
         self.assertEqual({file.name for file in directory.iterdir()},
                          {"Café notes.md", "%50inned.md", "A%2FB%2520.md", "Pinned.md"})
         md = (directory / "Café notes.md").read_bytes().decode("utf-8")
+        self.assertEqual([line[3:] for line in md.splitlines() if line.startswith("## Example ")], example_order)
         self.assertIn("## Example 0\nShort text\n\n", md)
         self.assertIn("````snip\n" + examples[1] + "\n````", md)
         self.assertNotIn("Screenshot", (directory / "Pinned.md").read_text())
@@ -656,7 +861,10 @@ exit 1''')
         self.env["SNIP_DATA_DIR"] = str(self.root / "restored")
         self.assertEqual(self.snip("import", directory), {"imported": 9, "skipped": 0})
         self.assertEqual(self.snip("import", directory), {"imported": 0, "skipped": 9})
-        saved = {item["title"]: item for item in self.snip("snapshot")["items"]}
+        restored = self.snip("snapshot")
+        self.assertEqual(self.tab_orders(restored)["Café notes"], example_order)
+        saved = {item["title"]: item for item in restored["items"]}
+        self.assertFalse(saved["Example 1"]["pinned"])
         for index, body in enumerate(examples):
             item = saved[f"Example {index}"]
             self.assertEqual(item["body"], body)
@@ -668,12 +876,13 @@ exit 1''')
 
     def test_import_single_markdown_and_reject_invalid_json(self):
         source = self.root / "Shell.md"
+        self.add_text("Existing", "Shell")
         source.write_text("## Script\n```sh\n## Not a new item\n```\n\n## Another\nhi\n")
         self.assertEqual(self.snip("import", source), {"imported": 2, "skipped": 0})
         items = self.snip("snapshot")["items"]
         self.assertEqual({item["categoryName"] for item in items}, {"Shell"})
-        self.assertEqual({item["title"]: item["body"] for item in items},
-                         {"Script": "```sh\n## Not a new item\n```", "Another": "hi"})
+        self.assertEqual([(item["title"], item["body"]) for item in items],
+                         [("Script", "```sh\n## Not a new item\n```"), ("Another", "hi"), ("Existing", "Existing")])
         broken = self.root / "invalid.json"
         broken.write_text('{"format":"snip","version":2,"categories":[],"items":[]}')
         self.assertIn("Expected a Snip JSON export", self.snip("import", broken, success=False))
@@ -707,7 +916,7 @@ exit 1''')
         self.assertEqual(result.returncode, 0, result.stderr)
         public = {"add", "paste", "edit", "export", "import", "doctor", "config"}
         internal = ("snapshot", "pin-inbox", "save-inbox", "save-inbox-new", "toggle-pin", "delete",
-                    "delete-category", "create-category", "used")
+                    "delete-category", "create-category", "used", "swap-order")
         listed = {line.split()[0] for line in result.stdout.partition("commands:\n")[2].splitlines()
                   if line.startswith("    ")}
         self.assertEqual(listed, public)

@@ -103,7 +103,18 @@ def migrate_saved_images(connection: sqlite3.Connection) -> None:
             connection.execute("UPDATE items SET path = ? WHERE id = ?", (owned, row["id"]))
 
 
-MIGRATIONS = (create_baseline_schema, migrate_saved_images)
+def migrate_item_positions(connection: sqlite3.Connection) -> None:
+    connection.execute("ALTER TABLE items ADD COLUMN position INTEGER NOT NULL DEFAULT 0")
+    connection.execute(
+        "UPDATE items SET position = ranked.position FROM ("
+        "SELECT id, ROW_NUMBER() OVER ("
+        "ORDER BY pinned DESC, COALESCE(last_used_at, updated_at) DESC, id DESC) AS position "
+        "FROM items) AS ranked WHERE items.id = ranked.id"
+    )
+    connection.execute("CREATE UNIQUE INDEX items_position ON items(position)")
+
+
+MIGRATIONS = (create_baseline_schema, migrate_saved_images, migrate_item_positions)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 
@@ -424,6 +435,36 @@ def delete_item(connection: sqlite3.Connection, item: sqlite3.Row) -> None:
     path.unlink(missing_ok=True)
 
 
+def first_position(connection: sqlite3.Connection, count: int = 1) -> int:
+    """Start a block of free positions before every item, under the write lock."""
+    return connection.execute("SELECT COALESCE(MIN(position), 0) FROM items").fetchone()[0] - count
+
+
+def swap_order(connection: sqlite3.Connection, first_id: int, second_id: int) -> dict[str, object]:
+    if first_id == second_id:
+        raise ValueError("choose two different snippets to swap")
+    with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            rows = connection.execute(
+                "SELECT id, pinned, position FROM items WHERE id IN (?, ?)", (first_id, second_id)
+            ).fetchall()
+        except OverflowError:
+            rows = []
+        if len(rows) != 2:
+            raise ValueError("snippet no longer exists")
+        first, second = rows
+        if first["pinned"] != second["pinned"]:
+            raise ValueError("cannot swap pinned and unpinned snippets")
+        # SQLite checks uniqueness at each update, so park one item in a free slot.
+        connection.executemany("UPDATE items SET position = ? WHERE id = ?", (
+            (first_position(connection), first["id"]),
+            (first["position"], second["id"]),
+            (second["position"], first["id"]),
+        ))
+        return snapshot(connection)
+
+
 def upsert_clipboard_item(
     connection: sqlite3.Connection,
     ref: str,
@@ -438,13 +479,14 @@ def upsert_clipboard_item(
         path = store_image(Path(path), ref)
     row = connection.execute(
         "INSERT INTO items "
-        "(category_id, kind, title, body, path, mime, content_hash, pinned) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "(category_id, kind, title, body, path, mime, content_hash, pinned, position) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(content_hash) DO UPDATE SET "
         "category_id = COALESCE(excluded.category_id, items.category_id), "
         "pinned = MAX(items.pinned, excluded.pinned), path = excluded.path, "
-        "updated_at = CURRENT_TIMESTAMP RETURNING id",
-        (category_id, kind, entry["title"], entry["body"], path, entry["mime"], ref, int(pin)),
+        "position = excluded.position, updated_at = CURRENT_TIMESTAMP RETURNING id",
+        (category_id, kind, entry["title"], entry["body"], path, entry["mime"], ref, int(pin),
+         first_position(connection)),
     ).fetchone()
     return int(row[0])
 
@@ -469,7 +511,7 @@ def library_items(connection: sqlite3.Connection) -> list[dict[str, object]]:
         item_record(row)
         for row in connection.execute(
             f"SELECT {ITEM_FIELDS} FROM items "
-            "ORDER BY pinned DESC, COALESCE(last_used_at, updated_at) DESC, id DESC"
+            "ORDER BY pinned DESC, position ASC"
         )
     ]
 
@@ -599,7 +641,8 @@ def category_for_name(connection: sqlite3.Connection, name: str) -> int:
 
 
 def insert_imported_item(
-    connection: sqlite3.Connection, category_id: int | None, item: dict[str, object], source_dir: Path
+    connection: sqlite3.Connection, category_id: int | None, item: dict[str, object], source_dir: Path,
+    position: int,
 ) -> bool:
     kind = item.get("kind", "text")
     title = item.get("title")
@@ -625,11 +668,11 @@ def insert_imported_item(
         image = (source_dir / path).absolute()
         path = str(image) if image_missing(str(image)) else store_image(image, digest)
     cursor = connection.execute(
-        "INSERT INTO items(category_id, kind, title, body, path, mime, content_hash, pinned, "
+        "INSERT INTO items(category_id, kind, title, body, path, mime, content_hash, pinned, position, "
         "created_at, updated_at, last_used_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP), ?) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP), ?) "
         "ON CONFLICT(content_hash) DO NOTHING",
-        (category_id, kind, title, body, path, mime, digest, int(pinned), *dates),
+        (category_id, kind, title, body, path, mime, digest, int(pinned), position, *dates),
     )
     return cursor.rowcount == 1
 
@@ -652,9 +695,7 @@ def read_import(path: Path):
                 raise ValueError("Invalid category in Snip export")
             categories[category["id"]] = category["name"]
         items = []
-        # Exports are newest-first; insert oldest-first so equal timestamps
-        # still tie-break by recency with the new local IDs.
-        for item in reversed(data["items"]):
+        for item in data["items"]:
             if not isinstance(item, dict):
                 raise ValueError("Invalid item in Snip export")
             category_id = item.get("categoryId")
@@ -682,8 +723,9 @@ def import_library(connection: sqlite3.Connection, path: Path) -> dict[str, int]
     with connection:
         connection.execute("BEGIN IMMEDIATE")
         category_ids = {name: category_for_name(connection, name) for name in categories}
-        imported = sum(insert_imported_item(connection, category_ids.get(category), item, source_dir)
-                       for category, item in items)
+        start = first_position(connection, len(items))
+        imported = sum(insert_imported_item(connection, category_ids.get(category), item, source_dir, start + offset)
+                       for offset, (category, item) in enumerate(items))
     return {"imported": imported, "skipped": len(items) - imported}
 
 
@@ -780,12 +822,13 @@ def capture(connection: sqlite3.Connection, args: argparse.Namespace) -> dict[st
         connection.execute("BEGIN IMMEDIATE")
         category_id = None if category is None else category_for_name(connection, category)
         row = connection.execute(
-            "INSERT INTO items(category_id, kind, title, body, mime, content_hash, pinned) "
-            "VALUES (?, 'text', ?, ?, 'text/plain', ?, ?) "
+            "INSERT INTO items(category_id, kind, title, body, mime, content_hash, pinned, position) "
+            "VALUES (?, 'text', ?, ?, 'text/plain', ?, ?, ?) "
             "ON CONFLICT(content_hash) DO UPDATE SET category_id = excluded.category_id, "
             "title = excluded.title, pinned = MAX(items.pinned, excluded.pinned), "
-            f"updated_at = CURRENT_TIMESTAMP RETURNING {ITEM_FIELDS}",
-            (category_id, title, body, content_hash("text", body, ""), int(args.pin or category is None)),
+            f"position = excluded.position, updated_at = CURRENT_TIMESTAMP RETURNING {ITEM_FIELDS}",
+            (category_id, title, body, content_hash("text", body, ""), int(args.pin or category is None),
+             first_position(connection)),
         ).fetchone()
     if args.notify:
         notify("Snip saved a snippet", title)
@@ -932,6 +975,10 @@ def build_parser() -> argparse.ArgumentParser:
     toggle = subparsers.add_parser("toggle-pin")
     toggle.add_argument("item_id", type=int)
 
+    swap = subparsers.add_parser("swap-order")
+    swap.add_argument("first_id", type=int, metavar="ID")
+    swap.add_argument("second_id", type=int, metavar="ID")
+
     delete = subparsers.add_parser("delete")
     delete.add_argument("item_id", type=int)
 
@@ -1028,6 +1075,8 @@ def main() -> int:
                         connection, args.ref, category_id=category_id
                     )
                 output({"ok": True, "id": item_id, "categoryId": category_id})
+            elif args.command == "swap-order":
+                output(swap_order(connection, args.first_id, args.second_id))
             elif args.command in ("toggle-pin", "delete"):
                 with connection:
                     connection.execute("BEGIN IMMEDIATE")
@@ -1041,26 +1090,32 @@ def main() -> int:
                         delete_item(connection, item)
                     else:
                         connection.execute(
-                            "UPDATE items SET pinned = NOT pinned, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                            (args.item_id,),
+                            "UPDATE items SET pinned = NOT pinned, position = ?, "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (first_position(connection), args.item_id),
                         )
                 output({"ok": True})
             elif args.command == "delete-category":
-                category = connection.execute(
-                    "SELECT name FROM categories WHERE id = ?", (args.category_id,)
-                ).fetchone()
-                if category is None:
-                    raise ValueError("category no longer exists")
                 with connection:
-                    moved = connection.execute(
-                        "UPDATE items SET pinned = 1, updated_at = CURRENT_TIMESTAMP "
-                        "WHERE category_id = ?",
+                    connection.execute("BEGIN IMMEDIATE")
+                    category = connection.execute(
+                        "SELECT name FROM categories WHERE id = ?", (args.category_id,)
+                    ).fetchone()
+                    if category is None:
+                        raise ValueError("category no longer exists")
+                    items = connection.execute(
+                        "SELECT id FROM items WHERE category_id = ? ORDER BY pinned DESC, position ASC",
                         (args.category_id,),
-                    ).rowcount
+                    ).fetchall()
+                    start = first_position(connection, len(items))
+                    connection.executemany(
+                        "UPDATE items SET pinned = 1, position = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        ((start + offset, row["id"]) for offset, row in enumerate(items)),
+                    )
                     connection.execute(
                         "DELETE FROM categories WHERE id = ?", (args.category_id,)
                     )
-                output({"ok": True, "name": category["name"], "moved": moved})
+                output({"ok": True, "name": category["name"], "moved": len(items)})
             elif args.command == "edit":
                 item = connection.execute(
                     "SELECT kind, title, body, content_hash FROM items WHERE id = ?", (args.item_id,)
