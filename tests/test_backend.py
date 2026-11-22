@@ -214,6 +214,18 @@ root = Path(os.environ['HOME'])
         self.env["XDG_CONFIG_HOME"] = ""
         self.assertEqual(self.snip("config")["configFile"], str(self.root / ".config/snip/config.json"))
 
+    def test_config_accepts_reorder_defaults_and_overrides(self):
+        config = self.snip("config")
+        self.assertEqual(config["keys"]["moveUp"], ["Shift+K"])
+        self.assertEqual(config["keys"]["moveDown"], ["Shift+J"])
+        self.assertEqual(config["warnings"], [])
+
+        self.write_config({"keys": {"moveUp": ["Ctrl+Up"], "moveDown": []}})
+        config = self.snip("config")
+        self.assertEqual(config["keys"]["moveUp"], ["Ctrl+Up"])
+        self.assertEqual(config["keys"]["moveDown"], [])
+        self.assertEqual(config["warnings"], [])
+
     def test_config_merges_per_action(self):
         overrides = {
             "startInSearch": True,

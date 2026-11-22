@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-22
+
+### Added
+
+- Reorder saved snippets within their pinned or unpinned group with `Shift+K` and `Shift+J`.
+
+### Changed
+
+- Pasting, copying, and editing a saved snippet no longer move it.
+
+### Fixed
+
+- Opening Snip or scrolling rows under a still pointer no longer changes the selection.
+- Snippet and tab text displays literally instead of interpreting markup.
+
 ## [1.0.0] - 2026-11-21
 
 ### Added

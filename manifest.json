@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "themaxcoder.snip",
   "name": "Snip",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "TheMaxCoder",
   "description": "Keyboard-first snippet and clipboard picker",
   "kinds": [

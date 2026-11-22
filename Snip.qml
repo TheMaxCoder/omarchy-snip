@@ -8,6 +8,7 @@ import qs.Ui
 import "Keys.js" as KeyBindings
 import "Search.js" as Search
 import "Pointer.js" as Pointer
+import "Order.js" as Order
 
 Item {
   id: root
@@ -44,6 +45,7 @@ Item {
   property int deleteArmedId: -1
   property int deleteArmedCategoryId: -1
   property string pendingAction: ""
+  property bool listCurrent: false
   property string processOutput: ""
   property string processError: ""
 
@@ -105,6 +107,8 @@ Item {
 
   function close(payload) {
     root.opened = false
+    root.listCurrent = false
+    if (root.pendingAction) root.pendingAction = "discard"
     root.startModePending = false
     root.searchMode = false
     root.searchText = ""
@@ -169,6 +173,7 @@ Item {
       root.status("Still working…", "warning")
       return false
     }
+    root.listCurrent = false
     root.pendingAction = action
     root.processOutput = ""
     root.processError = ""
@@ -180,17 +185,21 @@ Item {
   function applySnapshot(raw) {
     try {
       var data = JSON.parse(raw)
+      if (!data || !Array.isArray(data.categories) || !Array.isArray(data.items) || !Array.isArray(data.inbox))
+        throw new Error("Invalid snapshot")
       root.clipboardFile = data.clipboardFile || ""
-      root.categories = data.categories || []
-      root.savedItems = data.items || []
-      root.inboxItems = data.inbox || []
+      root.categories = data.categories
+      root.savedItems = data.items
+      root.inboxItems = data.inbox
       if (root.currentTab >= root.tabCount) root.currentTab = Math.max(0, root.tabCount - 1)
     } catch (error) {
       root.status("Could not read Snip data", "danger")
-      return
+      return false
     }
     if (root.resetSelectionOnSnapshot) root.selectedIndex = 0
     root.rebuildDisplay(!root.resetSelectionOnSnapshot)
+    root.listCurrent = true
+    return true
   }
 
   function status(message, tone) {
@@ -219,8 +228,9 @@ Item {
     var row = root.selectedItem
     var itemAction = !row ? [] : row.source === "inbox" ? ["save", "save"]
       : row.kind === "text" ? ["edit", "edit"] : []
+    var reorder = row && row.source === "saved" ? ["reorder", "moveUp", "moveDown"] : []
     return root.hints(root.keymap, [["tabs", "prevTab", "nextTab"], ["move", "up", "down"],
-      ["ends", "first", "last"], ["pin", "pin"], itemAction,
+      ["ends", "first", "last"], ["pin", "pin"], reorder, itemAction,
       ["delete", "delete"], ["tab +/−", "newTab", "deleteTab"], ["search", "search"],
       ["paste", "paste"], ["copy", "copy"], ["close", "back", "close"]])
   }
@@ -396,6 +406,31 @@ Item {
     preview.contentY = 0
   }
 
+  function moveSelected(direction) {
+    if (backend.running || configReader.running || refreshTimer.running) {
+      root.status("Still working…", "warning")
+      return
+    }
+    var row = root.selectedItem
+    if (!row) return
+    if (row.source !== "saved") {
+      root.status("Move items in saved tabs", "warning")
+      return
+    }
+    if (!root.listCurrent) {
+      // An earlier snapshot failed; request a fresh one before choosing a neighbor.
+      if (root.runBackend(["snapshot"], "snapshot")) root.status("Still working…", "warning")
+      return
+    }
+    var neighbor = Order.neighbor(root.displayRows, root.selectedIndex, direction)
+    if (!neighbor) return
+    if (neighbor.reason) {
+      root.status(neighbor.reason, "warning")
+      return
+    }
+    root.runBackend(["swap-order", String(row.itemId), String(root.displayRows[neighbor.index].itemId)], "swap")
+  }
+
   function pasteSelected(copyOnly) {
     var row = root.selectedItem
     if (!row || !root.checkBackendPath()) return
@@ -474,10 +509,12 @@ Item {
       return
     }
     root.deleteArmedCategoryId = -1
-    root.currentTab = 1
-    root.selectedIndex = 0
-    if (root.runBackend(["delete-category", String(category.id)], "mutate"))
+    if (root.runBackend(["delete-category", String(category.id)], "mutate")) {
+      root.currentTab = 1
+      root.selectedIndex = 0
+      root.rebuildDisplay()
       root.status("Deleted “" + category.name + "” · snippets moved to Pinned", "danger")
+    }
   }
 
   function editSelected() {
@@ -533,13 +570,15 @@ Item {
     onExited: function(exitCode) {
       var action = root.pendingAction
       root.pendingAction = ""
-      if (!root.opened) return
+      if (!root.opened || action === "discard") return
       if (exitCode !== 0) {
         root.status(root.processError.trim() || "Snip operation failed", "danger")
+        if (action !== "snapshot") refreshTimer.restart()
         return
       }
-      if (action === "snapshot") root.applySnapshot(root.processOutput)
-      else {
+      if (action === "snapshot" || action === "swap") {
+        if (!root.applySnapshot(root.processOutput) && action === "swap") refreshTimer.restart()
+      } else {
         if (action === "copy") root.status("Copied", "success")
         refreshTimer.restart()
       }
@@ -732,6 +771,8 @@ Item {
           else if (action === "first") root.selectAbsolute(0)
           else if (action === "last") root.selectAbsolute(root.displayRows.length - 1)
           else if (action === "pin") root.quickPin()
+          else if (action === "moveUp") root.moveSelected(-1)
+          else if (action === "moveDown") root.moveSelected(1)
           else if (action === "save") root.openSavePicker()
           else if (action === "delete") root.deleteSelected()
           else if (action === "deleteTab") root.deleteCurrentTab()

@@ -19,6 +19,8 @@
     "deleteTab": ["Shift+D"],
     "search": ["/"],
     "back": ["Escape"],
-    "close": ["q"]
+    "close": ["q"],
+    "moveUp": ["Shift+K"],
+    "moveDown": ["Shift+J"]
   }
 }

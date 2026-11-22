@@ -44,6 +44,8 @@ ln -s ~/.config/omarchy/plugins/themaxcoder.snip/bin/snip ~/.local/bin/snip
 | Paste | `Return`, `Enter`, `p` |
 | Copy | `y`, `Ctrl+C`, `Super+C` |
 | Pin or unpin | `f` |
+| Move saved item up | `Shift+K` |
+| Move saved item down | `Shift+J` |
 | Save Inbox item to a tab | `s` |
 | Edit a saved text snippet (save Inbox items first) | `i` |
 | Delete item | `d` |
@@ -54,6 +56,8 @@ ln -s ~/.config/omarchy/plugins/themaxcoder.snip/bin/snip ~/.local/bin/snip
 | Close | `q` |
 
 Digits `0`–`9` jump to tabs outside the save and new-tab dialogs. Press `/` for ranked search across saved snippets and the Inbox. Search treats letters as query text; use the arrows to move, `Enter` to paste, and `Ctrl+C` or `Super+C` to copy. `Escape` clears the query, then returns to navigation, then closes.
+
+Saved tabs keep the order you set, and new snippets go to the top of their pinned or unpinned group.
 
 ## Configuration and editing
 
@@ -84,7 +88,7 @@ JSON exports go to stdout by default and reference images by path; they don't em
 
 - Config: `${XDG_CONFIG_HOME:-~/.config}/snip/config.json`.
 - Saved snippets and images: `${XDG_DATA_HOME:-~/.local/share}/snip/` (`snip.db` and `images/`).
-- Inbox history: `~/.local/state/omarchy/clipboard-history.json`, managed by Omarchy.
+- Inbox history: `~/.local/state/omarchy/clipboard-history.json`. Omarchy keeps up to 500 clipboard history entries; Snip has no limit on saved snippets.
 
 Snip stores text in plaintext SQLite and sends nothing over the network. Omarchy does not record clipboard entries marked sensitive in its history; avoid manually capturing secrets or exporting them.
 

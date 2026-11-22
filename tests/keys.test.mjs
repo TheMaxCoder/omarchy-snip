@@ -96,6 +96,16 @@ test('search keymap keeps eligible shortcuts and does not consume query letters'
   assert.equal(tabDigit(event(49, '1', Qt.ControlModifier)), -1);
 });
 
+test('shifted J and K reorder in navigation but remain query letters in search', () => {
+  const search = keymapFor(defaults, ['up', 'down', 'paste', 'copy', 'back'], true);
+  for (const [letter, action] of [['K', 'moveUp'], ['J', 'moveDown']]) {
+    const shifted = event(letter.charCodeAt(0), letter, Qt.ShiftModifier);
+    assert.equal(actionFor(shifted, defaults), action);
+    assert.equal(textInputAction(shifted, search), '');
+    assert.equal(printableText(shifted), letter);
+  }
+});
+
 test('save picker uses configured navigation while a new tab name can still contain p', () => {
   const keymap = { ...defaults, up: ['F1'], back: ['Ctrl+C'] };
   const save = keymapFor(keymap, ['up', 'down', 'paste', 'back'], false);
